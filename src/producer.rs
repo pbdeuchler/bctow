@@ -30,6 +30,24 @@ impl<T: Send + Sync + 'static> Producer<T> {
         self.publish_id(id, msg)
     }
 
+    /// Resolve a `TopicId` back to its original topic string.
+    ///
+    /// Returns `None` if the id has never been interned. Intended for debug
+    /// and logging paths — do not call on hot paths.
+    pub fn topic_name(&self, id: TopicId) -> Option<String> {
+        self.inner.interner.name(id)
+    }
+
+    /// Intern `topic` and return its `TopicId` without publishing a message.
+    ///
+    /// Use this to obtain a `TopicId` for repeated `publish_id` calls, avoiding
+    /// the string interning overhead on every publish.  The topic will not be
+    /// visible to consumers (i.e. `subscribe` will fail) until at least one
+    /// message has been published to it.
+    pub fn intern_topic(&self, topic: &str) -> TopicId {
+        self.inner.interner.intern(topic)
+    }
+
     /// Publish `msg` directly to a known `TopicId`. Hot path — no string work.
     ///
     /// Returns the sequence number assigned to the message.

@@ -33,6 +33,15 @@ impl<T: Send + Sync + 'static> ConsumerContext<T> {
         }
     }
 
+    /// Resolve a `TopicId` back to its original topic string.
+    ///
+    /// Returns `None` if the id has never been interned (which should not
+    /// happen for ids obtained from `poll`). Intended for debug and logging
+    /// paths — do not call on hot paths.
+    pub fn topic_name(&self, id: TopicId) -> Option<String> {
+        self.inner.interner.name(id)
+    }
+
     #[cfg(feature = "metrics")]
     pub fn metrics(&self) -> Metrics {
         use std::sync::atomic::Ordering;

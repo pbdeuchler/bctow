@@ -3,9 +3,11 @@
 //! Demonstrates:
 //!   - Creating a broker with a custom config
 //!   - Publishing messages on multiple topics
+//!   - Capturing the sequence number returned by publish
+//!   - Using publish_id for hot-path publishing (skip per-call string interning)
 //!   - Creating consumer clients from a ConsumerContext
 //!   - Subscribing to topics
-//!   - Polling for messages
+//!   - Polling for messages with topic_name resolution
 //!   - Dynamic subscribe/unsubscribe
 //!   - Round-robin fairness across subscribed topics
 
@@ -34,21 +36,31 @@ fn main() {
     //
     // Topics are created on first publish — no prior declaration needed.
     // `publish` returns the sequence number assigned to the message.
-    // For hot paths, intern the topic string once with the `TopicId` API
-    // to skip the string interning overhead on every call.
     // -------------------------------------------------------------------
     for i in 0..6u32 {
-        producer.publish("sensors/temperature", format!("temp={i}"));
-        producer.publish("sensors/humidity",    format!("hum={i}"));
+        let seq = producer.publish("sensors/temperature", format!("temp={i}"));
+        if i == 0 {
+            println!("First temperature message assigned sequence number: {seq}");
+        }
+        producer.publish("sensors/humidity", format!("hum={i}"));
     }
+
+    // -------------------------------------------------------------------
+    // 2b. publish_id — hot-path publishing without per-call string interning.
+    //
+    // Intern the topic string once to get a TopicId, then use publish_id
+    // on every subsequent call.  This avoids the string lookup on each
+    // publish and is the preferred pattern for high-throughput paths.
+    // -------------------------------------------------------------------
+    let temp_id = producer.intern_topic("sensors/temperature");
+    let seq = producer.publish_id(temp_id, "temp=via-id".to_owned());
+    println!("Published via publish_id (topic={temp_id:?}), sequence={seq}");
 
     // -------------------------------------------------------------------
     // 3. Create consumer clients.
     //
     // Each `ConsumerClient` maintains its own per-topic cursors and is
     // NOT Clone or Sync — it is owned by a single consumer thread.
-    // New clients start just past the latest sequence: they see only
-    // messages published AFTER the client is created.
     // -------------------------------------------------------------------
     let mut client_a = ctx.create_client();
     let mut client_b = ctx.create_client();
@@ -65,8 +77,9 @@ fn main() {
     // 5. Subscribe to topics.
     //
     // `subscribe` resolves the topic string to a TopicId and records a
-    // cursor starting at the current head of the ring.  Subscribing to a
-    // topic that has never been published to returns `BctowError::TopicNotFound`.
+    // cursor starting at the current head of the ring at subscribe time.
+    // Subscribing to a topic that has never been published to returns
+    // `BctowError::TopicNotFound`.
     //
     // client_a follows both topics; client_b follows only temperature.
     // -------------------------------------------------------------------
@@ -91,19 +104,22 @@ fn main() {
     // message across all subscribed topics, or `None` when the client is
     // fully caught up.
     //
+    // Use `ctx.topic_name(id)` to resolve a TopicId back to its string for
+    // display or logging — do not call this on the hot path.
+    //
     // The polling order rotates across topics on each call so that a
     // high-throughput topic cannot starve a low-throughput one.
     // -------------------------------------------------------------------
-    println!("=== client_a (temperature + humidity) ===");
+    println!("\n=== client_a (temperature + humidity) ===");
     while let Some((topic_id, msg)) = client_a.poll() {
-        // TopicId is an opaque u32 handle; use the context to resolve it
-        // back to a name for display purposes only (not for hot paths).
-        println!("  topic={topic_id:?}  msg={msg}");
+        let name = ctx.topic_name(topic_id).unwrap_or_else(|| format!("{topic_id:?}"));
+        println!("  topic={name}  msg={msg}");
     }
 
     println!("\n=== client_b (temperature only) ===");
     while let Some((topic_id, msg)) = client_b.poll() {
-        println!("  topic={topic_id:?}  msg={msg}");
+        let name = ctx.topic_name(topic_id).unwrap_or_else(|| format!("{topic_id:?}"));
+        println!("  topic={name}  msg={msg}");
     }
 
     // -------------------------------------------------------------------
@@ -135,7 +151,8 @@ fn main() {
             }
         }
         prev_topic = Some(topic_id);
-        println!("  topic={topic_id:?}  msg={msg}");
+        let name = ctx.topic_name(topic_id).unwrap_or_else(|| format!("{topic_id:?}"));
+        println!("  topic={name}  msg={msg}");
     }
     println!("  topic alternations: {alternations}  (> 0 confirms round-robin)");
 
@@ -156,7 +173,8 @@ fn main() {
 
     // Read one message to show both subscriptions are active.
     if let Some((id, msg)) = dyn_client.poll() {
-        println!("  before unsubscribe: topic={id:?}  msg={msg}");
+        let name = ctx.topic_name(id).unwrap_or_else(|| format!("{id:?}"));
+        println!("  before unsubscribe: topic={name}  msg={msg}");
     }
 
     // Unsubscribe from humidity by name.
@@ -167,7 +185,8 @@ fn main() {
 
     // Only temperature messages should appear now.
     while let Some((id, msg)) = dyn_client.poll() {
-        println!("  after unsubscribe:  topic={id:?}  msg={msg}");
+        let name = ctx.topic_name(id).unwrap_or_else(|| format!("{id:?}"));
+        println!("  after unsubscribe:  topic={name}  msg={msg}");
     }
 
     // -------------------------------------------------------------------

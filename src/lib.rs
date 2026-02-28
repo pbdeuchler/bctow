@@ -7,7 +7,7 @@
 //! ## Quick start
 //!
 //! ```rust
-//! use bctow::{BctowConfig, OverflowPolicy, broker};
+//! use bctow::{BctowConfig, broker};
 //!
 //! let (producer, ctx) = broker::<String>(BctowConfig::default());
 //!
@@ -62,12 +62,13 @@
 //!
 //! ## Memory layout
 //!
-//! Ring buffers are **pre-allocated** at topic creation time — no per-message heap
-//! allocation occurs on the steady-state publish path.  Topic creation itself (the
-//! first `publish` call for a new topic string) allocates a `RingBuffer`, interns
-//! the topic string, and acquires a write lock on the rings map; this is the only
-//! allocation-heavy, lock-acquiring step.  All subsequent publishes to known topics
-//! take only the read path of that lock.
+//! Ring buffer **slots** are pre-allocated at topic creation time.  Each `publish`
+//! call incurs exactly one `Arc` allocation to wrap the value before writing it into
+//! a slot; this is the steady-state per-message cost.  Topic creation itself (the
+//! first `publish` call for a new topic string) additionally allocates a
+//! `RingBuffer`, interns the topic string, and acquires a write lock on the rings
+//! map; all subsequent publishes to known topics take only the read path of that
+//! lock.
 //!
 //! ## Concurrency model
 //!
@@ -99,7 +100,7 @@
 //! | Policy         | Behaviour                                                   |
 //! |----------------|-------------------------------------------------------------|
 //! | `DropOldest`   | Skip the consumer's cursor to the oldest available message  |
-//! | `DropNewest`   | Leave the cursor in place; the consumer misses new messages |
+//! | `DropNewest`   | Cursor stays in place; consumer becomes stuck and receives no further messages until re-subscribed |
 //! | `SkipToLatest` | Jump the cursor past the latest message; skip all backlog   |
 //!
 //! `DropOldest` is the default and is appropriate for most streaming workloads

@@ -2,7 +2,8 @@
 pub enum OverflowPolicy {
     /// Oldest messages are overwritten when the buffer is full.
     DropOldest,
-    /// New messages are rejected when the buffer is full.
+    /// A lagging consumer's cursor stays in place; the consumer becomes stuck
+    /// and will not receive further messages until re-subscribed.
     DropNewest,
     /// A lagging consumer jumps to the latest message on overrun.
     SkipToLatest,

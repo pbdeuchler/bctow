@@ -5,7 +5,7 @@ Buffalo Chicken Tender on White — a high-performance, in-process, topic-based 
 ## Key features
 
 - **Single producer, multiple consumers** — one writer thread, any number of reader threads, no runtime mutex on the publish hot path.
-- **Per-topic ring buffers** — pre-allocated slots; no steady-state heap allocation after topic creation.
+- **Per-topic ring buffers** — slots pre-allocated at topic creation; steady-state publish cost is a single `Arc` allocation per message.
 - **Lock-free reads** — consumers read from the ring using `Acquire`/`Release` atomics.
 - **Per-client cursors** — each `ConsumerClient` tracks its own position; consumers never block each other.
 - **Round-robin fairness** — `poll` rotates across subscribed topics so a high-throughput topic cannot starve others.
@@ -22,14 +22,10 @@ Buffalo Chicken Tender on White — a high-performance, in-process, topic-based 
 ## Quick example
 
 ```rust
-use bctow::{BctowConfig, OverflowPolicy, broker};
+use bctow::{BctowConfig, broker};
 
 fn main() {
-    let config = BctowConfig {
-        ring_buffer_capacity: 1024,
-        overflow_policy: OverflowPolicy::DropOldest,
-        ..BctowConfig::default()
-    };
+    let config = BctowConfig::default();
 
     // broker() returns a matched Producer + ConsumerContext pair.
     let (producer, ctx) = broker::<String>(config);
@@ -70,7 +66,7 @@ cargo run --all-features --example basic
 | Policy         | Behaviour when consumer lags                          |
 |----------------|-------------------------------------------------------|
 | `DropOldest`   | Skip cursor to oldest available message (default)     |
-| `DropNewest`   | Leave cursor in place; consumer misses new messages   |
+| `DropNewest`   | Cursor stays in place; consumer becomes stuck and receives no further messages until re-subscribed |
 | `SkipToLatest` | Jump cursor past latest message; skip entire backlog  |
 
 ## Optional features
