@@ -1,9 +1,16 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::RwLock;
 
 /// Compact identifier for a topic. Used on hot paths — no string work involved.
 #[derive(Copy, Clone, Hash, Eq, PartialEq, Debug)]
 pub struct TopicId(pub(crate) u32);
+
+impl fmt::Display for TopicId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Describes how a topic key should be matched against subscriptions.
 /// Only `Exact` is implemented; the enum exists so future variants
@@ -14,6 +21,11 @@ pub enum MatchKind {
 }
 
 /// Anything that can be used to identify a topic for publish/subscribe.
+///
+/// This trait exists for forward compatibility: today only exact-string matching
+/// is implemented, but future variants (`PrefixTopic`, `WildcardTopic`, …) will
+/// implement `TopicKey` so callers can pass any key type to a unified API without
+/// breaking existing code.
 pub trait TopicKey {
     fn topic_str(&self) -> &str;
     fn match_kind(&self) -> MatchKind;

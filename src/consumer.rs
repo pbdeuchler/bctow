@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -84,9 +85,9 @@ impl<T: Send + Sync + 'static> ConsumerClient<T> {
             .get_ring(topic)
             .ok_or_else(|| BctowError::TopicNotFound(format!("{topic:?}")))?;
 
-        if !self.subscriptions.contains_key(&topic) {
+        if let Entry::Vacant(e) = self.subscriptions.entry(topic) {
             let cursor = Cursor::new_latest(&ring);
-            self.subscriptions.insert(topic, (cursor, ring));
+            e.insert((cursor, ring));
             self.topic_order.push(topic);
         }
         Ok(())
@@ -116,6 +117,13 @@ impl<T: Send + Sync + 'static> ConsumerClient<T> {
     ///
     /// Returns `(TopicId, Arc<T>)` for the first available message, using a rotating
     /// start index for fairness. Returns `None` if no topic has a new message.
+    ///
+    /// **`DropOldest` contention note:** Under [`OverflowPolicy::DropOldest`], a single
+    /// `poll` call that encounters a lagged cursor may return `None` even when messages
+    /// exist in the ring. This occurs when the cursor skips to `oldest_available_seq` but
+    /// the producer races ahead and overwrites that slot before the read completes. The
+    /// cursor is advanced past the overwritten slot, so the subsequent `poll` call will
+    /// succeed.
     pub fn poll(&mut self) -> Option<(TopicId, Arc<T>)> {
         let count = self.topic_order.len();
         if count == 0 {

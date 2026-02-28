@@ -5,7 +5,7 @@ use std::fmt;
 /// This enum is `#[non_exhaustive]` so that new variants can be added in
 /// future minor releases without breaking downstream match expressions.
 #[non_exhaustive]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BctowError {
     /// The payload is too large for this broker's configuration.
     ///

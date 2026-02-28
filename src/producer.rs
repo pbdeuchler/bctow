@@ -16,15 +16,11 @@ pub struct Producer<T: Send + Sync + 'static> {
     pub(crate) _not_sync: PhantomData<Cell<()>>,
 }
 
-// Producer is Send (can be moved to another thread) but NOT Sync (must not be
-// shared between threads simultaneously). The PhantomData<Cell<()>> field
-// ensures the compiler cannot auto-derive Sync.
-unsafe impl<T: Send + Sync + 'static> Send for Producer<T> {}
-
 impl<T: Send + Sync + 'static> Producer<T> {
     /// Publish `msg` to `topic`. Creates the topic and its ring buffer on first use.
     ///
     /// Returns the sequence number assigned to the message.
+    #[inline]
     pub fn publish(&self, topic: &str, msg: T) -> u64 {
         let id = self.inner.interner.intern(topic);
         self.publish_id(id, msg)
@@ -51,6 +47,11 @@ impl<T: Send + Sync + 'static> Producer<T> {
     /// Publish `msg` directly to a known `TopicId`. Hot path — no string work.
     ///
     /// Returns the sequence number assigned to the message.
+    ///
+    /// **Note:** If `topic` has not been interned in this broker, a new ring
+    /// buffer is created. Callers should use [`Producer::intern_topic`] or
+    /// [`Producer::publish`] to obtain valid `TopicId`s.
+    #[inline]
     pub fn publish_id(&self, topic: TopicId, msg: T) -> u64 {
         let ring = self.inner.get_or_create_ring(topic);
         // SAFETY: Producer is the sole caller of push. The single-producer

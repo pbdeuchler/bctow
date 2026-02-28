@@ -1,18 +1,13 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OverflowPolicy {
     /// Oldest messages are overwritten when the buffer is full.
+    #[default]
     DropOldest,
     /// A lagging consumer's cursor stays in place; the consumer becomes stuck
     /// and will not receive further messages until re-subscribed.
     DropNewest,
     /// A lagging consumer jumps to the latest message on overrun.
     SkipToLatest,
-}
-
-impl Default for OverflowPolicy {
-    fn default() -> Self {
-        OverflowPolicy::DropOldest
-    }
 }
 
 #[derive(Debug, Clone)]
