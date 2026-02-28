@@ -1,0 +1,13 @@
+[package]
+name = "bctow"
+version = "0.1.0"
+edition = "2021"
+description = "Buffalo Chicken Tender on White - a high-performance topic-based pub/sub library"
+license = "MIT"
+
+[features]
+metrics = []
+
+[lib]
+name = "bctow"
+path = "src/lib.rs"
