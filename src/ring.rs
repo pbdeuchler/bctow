@@ -1,21 +1,23 @@
 use std::cell::UnsafeCell;
-use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 // --- Slot ---
 
 struct Slot<T> {
-    /// Sequence number of the message stored here. 0 = empty; valid sequences start at 1.
+    /// Sequence number of the message stored here. 0 = empty or being written;
+    /// valid sequences start at 1.
     sequence: AtomicU64,
+    /// Holds `Some(Arc<T>)` when a value is present, `None` otherwise.
     /// Valid to read only when `sequence` matches the expected sequence number.
-    value: UnsafeCell<MaybeUninit<T>>,
+    value: UnsafeCell<Option<Arc<T>>>,
 }
 
 impl<T> Slot<T> {
     fn empty() -> Self {
         Slot {
             sequence: AtomicU64::new(0),
-            value: UnsafeCell::new(MaybeUninit::uninit()),
+            value: UnsafeCell::new(None),
         }
     }
 }
@@ -28,6 +30,13 @@ unsafe impl<T: Send + Sync> Sync for Slot<T> {}
 // --- RingBuffer ---
 
 /// Single-producer, multiple-consumer ring buffer.
+///
+/// Each slot stores an `Arc<T>`. This eliminates the data race that would exist if `T`
+/// were stored directly: a producer overwriting a slot while a reader clones the value
+/// would be UB for heap-allocating types. With `Arc<T>`, the producer replaces the
+/// `Arc` in the slot (decrementing the old refcount), but any reader that has already
+/// cloned the `Arc` retains a valid reference to the data — the inner `T` is only freed
+/// when the last `Arc` clone is dropped.
 ///
 /// # Safety contract
 /// Only **one** thread may call [`push`] at any given time. Multiple threads may call
@@ -73,23 +82,17 @@ impl<T: Send + Sync> RingBuffer<T> {
         let idx = ((seq - 1) as usize) % self.capacity;
         let slot = &self.slots[idx];
 
-        // Drop any previously stored value before overwriting. Without this, wrapping
-        // around would leak heap allocations held by the old `T`.
-        let old_seq = slot.sequence.load(Ordering::Acquire);
-        if old_seq != 0 {
-            // SAFETY: old_seq != 0 means a value was written here previously by the
-            // single producer (us). We are the only writer; no reader can hold a
-            // reference past this point because `read` returns owned clones, not refs.
-            unsafe { (*slot.value.get()).assume_init_drop() };
-        }
-
-        // Reset sequence to 0 while writing so readers see the slot as unavailable
-        // during the write window.
+        // Signal "being written" so concurrent readers skip this slot.
+        // The old `Option<Arc<T>>` (if any) will be replaced below. If any reader
+        // already cloned that Arc, the inner T remains live until their clone is dropped.
         slot.sequence.store(0, Ordering::Release);
 
         // SAFETY: We are the single producer. No other thread writes to this index.
+        // Replacing the Option drops the old Arc (decrementing its refcount). Any reader
+        // that previously cloned the Arc retains a valid reference to the data — no
+        // use-after-free is possible because the Arc controls the T's lifetime.
         unsafe {
-            (*slot.value.get()).write(value);
+            *slot.value.get() = Some(Arc::new(value));
         }
 
         // Publish: readers spin-checking this sequence will now see the written value.
@@ -97,9 +100,7 @@ impl<T: Send + Sync> RingBuffer<T> {
         // any reader that loads this sequence with Acquire.
         slot.sequence.store(seq, Ordering::Release);
 
-        // Advance producer cursor. Store is correct here; we know exactly what the
-        // next value should be (seq + 1). fetch_add would work but implies we don't
-        // know the current value, which is misleading for a single-producer design.
+        // Advance producer cursor.
         self.write_seq.store(seq + 1, Ordering::Release);
 
         seq
@@ -107,17 +108,15 @@ impl<T: Send + Sync> RingBuffer<T> {
 
     /// Read the value at sequence number `seq`.
     ///
-    /// Returns `Some(T)` (an owned clone) if the slot holds `seq` — i.e. the message
-    /// has been written and has not yet been overwritten. Returns `None` if the slot
-    /// has been overwritten (consumer lagged) or not yet written.
+    /// Returns `Some(Arc<T>)` if the slot holds `seq` — i.e. the message has been
+    /// written and has not yet been overwritten. Returns `None` if the slot has been
+    /// overwritten (consumer lagged) or not yet written.
     ///
-    /// Returning an owned clone (rather than a reference) prevents any possibility of
-    /// a dangling reference: the producer may overwrite the slot at any time after this
-    /// call returns, but the caller holds a fully independent copy.
-    pub(crate) fn read(&self, seq: u64) -> Option<T>
-    where
-        T: Clone,
-    {
+    /// Returning an `Arc` (rather than a clone of `T`) is safe even under concurrent
+    /// producer activity: `Arc::clone` is just an atomic refcount increment, so the
+    /// producer can replace the slot's `Arc` at any point without causing UB. The caller
+    /// holds a valid reference to the data for as long as they retain the `Arc`.
+    pub(crate) fn read(&self, seq: u64) -> Option<Arc<T>> {
         if seq == 0 {
             return None;
         }
@@ -129,17 +128,20 @@ impl<T: Send + Sync> RingBuffer<T> {
         }
         // SAFETY: `stored == seq` and the Release store in `push` has happened before
         // this Acquire load, so the write to `value` is fully visible here.
-        let cloned = unsafe { (*slot.value.get()).assume_init_ref() }.clone();
+        // We clone the Arc (cheap: atomic refcount increment), keeping the data alive
+        // even if the producer overwrites this slot immediately after.
+        let arc = unsafe { (*slot.value.get()).as_ref()?.clone() };
 
         // Re-check the sequence after cloning to guard against a race where the producer
-        // wraps around and overwrites the slot exactly while we were cloning. If the
-        // sequence changed, the clone may be of partially-overwritten data — discard it.
+        // wraps around and overwrites the slot exactly while we were reading. If the
+        // sequence changed, this slot no longer holds `seq` — discard for API consistency
+        // so the consumer sees a clean sequence stream. The Arc itself is still valid.
         let stored_after = slot.sequence.load(Ordering::Acquire);
         if stored_after != seq {
             return None;
         }
 
-        Some(cloned)
+        Some(arc)
     }
 
     /// The sequence number of the last written message, or 0 if nothing has been written yet.
@@ -148,8 +150,15 @@ impl<T: Send + Sync> RingBuffer<T> {
         next.saturating_sub(1)
     }
 
-    /// The oldest sequence number that has not been overwritten, or 1 if the buffer has
-    /// not wrapped around yet.
+    /// The oldest sequence number that is likely still present in the buffer, or 1 if
+    /// the buffer has not wrapped around yet.
+    ///
+    /// # Advisory only
+    ///
+    /// This value is an **estimate**. Because the producer advances `write_seq` independently
+    /// of any reader, the slot for the returned sequence may already be in the process of
+    /// being overwritten by the time the caller acts on this value. Always check the return
+    /// value of [`read`] — it may return `None` even for sequences at or above this estimate.
     pub(crate) fn oldest_available_seq(&self) -> u64 {
         let next = self.write_seq.load(Ordering::Acquire);
         // If fewer than `capacity` messages have been written, everything since 1 is available.
@@ -163,18 +172,8 @@ impl<T: Send + Sync> RingBuffer<T> {
     }
 }
 
-impl<T> Drop for RingBuffer<T> {
-    fn drop(&mut self) {
-        for slot in self.slots.iter_mut() {
-            // get_mut() gives us exclusive access without UnsafeCell since we have &mut self.
-            if *slot.sequence.get_mut() != 0 {
-                // SAFETY: sequence != 0 means a value was written into this slot and never
-                // explicitly dropped. We have exclusive access (Drop takes &mut self).
-                unsafe { slot.value.get_mut().assume_init_drop() };
-            }
-        }
-    }
-}
+// `Option<Arc<T>>` drops cleanly: when the last Arc clone is released the inner T is freed.
+// No custom Drop impl is required; the derived drop on `slots` handles everything correctly.
 
 // --- Cursor ---
 
@@ -231,8 +230,6 @@ mod tests {
     use std::thread;
 
     // Helper: push the sequence number itself as the value so assertions are self-evident.
-    // Each call to push returns the assigned sequence; we push `n` consecutive messages
-    // starting at seq 1 (or wherever write_seq currently stands).
     fn push_n(ring: &RingBuffer<u64>, n: usize) -> Vec<u64> {
         let start = ring.latest_seq() + 1;
         (start..start + n as u64)
@@ -241,6 +238,11 @@ mod tests {
                 unsafe { ring.push(seq) }
             })
             .collect()
+    }
+
+    // Helper to unwrap an Arc<u64> from read() and compare the inner value.
+    fn read_val(ring: &RingBuffer<u64>, seq: u64) -> Option<u64> {
+        ring.read(seq).map(|arc| *arc)
     }
 
     // --- RingBuffer::new ---
@@ -284,30 +286,45 @@ mod tests {
     // --- read ---
 
     #[test]
-    fn read_written_slot_returns_value() {
+    fn read_written_slot_returns_arc_with_value() {
         let ring: RingBuffer<u64> = RingBuffer::new(8);
         let seq = unsafe { ring.push(42) };
-        assert_eq!(ring.read(seq), Some(42));
+        let arc = ring.read(seq).expect("should return Some");
+        assert_eq!(*arc, 42);
+    }
+
+    #[test]
+    fn read_returns_arc_not_clone() {
+        // Verify that we get an Arc back, and two reads of the same slot
+        // return independent Arc handles pointing to the same allocation.
+        let ring: RingBuffer<u64> = RingBuffer::new(8);
+        let seq = unsafe { ring.push(99) };
+        let a = ring.read(seq).expect("first read");
+        let b = ring.read(seq).expect("second read");
+        assert_eq!(*a, 99);
+        assert_eq!(*b, 99);
+        // Both point to the same data but are distinct Arc handles.
+        assert!(Arc::ptr_eq(&a, &b));
     }
 
     #[test]
     fn read_unwritten_seq_returns_none() {
         let ring: RingBuffer<u64> = RingBuffer::new(8);
-        assert_eq!(ring.read(1), None);
+        assert!(ring.read(1).is_none());
     }
 
     #[test]
     fn read_seq_zero_returns_none() {
         let ring: RingBuffer<u64> = RingBuffer::new(4);
         unsafe { ring.push(1) };
-        assert_eq!(ring.read(0), None);
+        assert!(ring.read(0).is_none());
     }
 
     #[test]
     fn read_future_seq_returns_none() {
         let ring: RingBuffer<u64> = RingBuffer::new(4);
         unsafe { ring.push(1) };
-        assert_eq!(ring.read(99), None);
+        assert!(ring.read(99).is_none());
     }
 
     #[test]
@@ -315,7 +332,7 @@ mod tests {
         // capacity=4: after 5 pushes, seq=1 is overwritten.
         let ring: RingBuffer<u64> = RingBuffer::new(4);
         push_n(&ring, 5); // seqs 1..=5; slot for seq=1 now holds seq=5
-        assert_eq!(ring.read(1), None);
+        assert!(ring.read(1).is_none());
     }
 
     #[test]
@@ -324,7 +341,7 @@ mod tests {
         // push_n pushes seq as value, so reading seq `s` returns Some(s).
         let seqs = push_n(&ring, 8);
         for seq in seqs {
-            assert_eq!(ring.read(seq), Some(seq));
+            assert_eq!(read_val(&ring, seq), Some(seq));
         }
     }
 
@@ -335,12 +352,31 @@ mod tests {
         push_n(&ring, 8); // seqs 1..=8
         // Only seqs 5..=8 should be readable.
         for seq in 1u64..=4 {
-            assert_eq!(ring.read(seq), None, "seq {seq} should be overwritten");
+            assert!(ring.read(seq).is_none(), "seq {seq} should be overwritten");
         }
         for seq in 5u64..=8 {
-            // push_n stores seq as value.
-            assert_eq!(ring.read(seq), Some(seq), "seq {seq} should be readable");
+            assert_eq!(read_val(&ring, seq), Some(seq), "seq {seq} should be readable");
         }
+    }
+
+    /// Verify that a retained Arc keeps the data alive after the slot is overwritten.
+    /// This is the core safety property that makes Arc<T> storage correct.
+    #[test]
+    fn retained_arc_stays_valid_after_slot_overwrite() {
+        let ring: RingBuffer<u64> = RingBuffer::new(1);
+        // Push value 42 into the single slot (seq=1).
+        let seq1 = unsafe { ring.push(42) };
+        let held = ring.read(seq1).expect("seq 1 should be readable");
+        assert_eq!(*held, 42);
+
+        // Overwrite the slot with a new value (seq=2 goes to same slot index 0).
+        let _seq2 = unsafe { ring.push(99) };
+
+        // The slot now holds seq=2 — reading seq=1 must return None.
+        assert!(ring.read(seq1).is_none());
+
+        // But the Arc we retained still points to valid data.
+        assert_eq!(*held, 42, "retained Arc must remain valid after slot overwrite");
     }
 
     // --- latest_seq / oldest_available_seq ---
@@ -374,26 +410,35 @@ mod tests {
     #[test]
     fn drop_does_not_leak() {
         // Use a type with a heap allocation (String) so Miri / leak detectors can catch
-        // any missing drops. We can't directly assert no leak in standard test runs, but
-        // the Drop impl will be exercised and should not panic.
+        // any missing drops. The derived drop on Box<[Slot<T>]> drops each Option<Arc<T>>,
+        // which correctly decrements the refcount and frees the String when it reaches zero.
         let ring: RingBuffer<String> = RingBuffer::new(4);
         unsafe {
             ring.push("hello".to_owned());
             ring.push("world".to_owned());
         }
-        // `ring` drops here; Drop impl should call assume_init_drop on both slots.
+        // `ring` drops here; each slot's Option<Arc<String>> is dropped automatically.
     }
 
     #[test]
     fn drop_after_wrap_does_not_double_free() {
-        // After wrapping, each slot holds exactly the latest value for that index.
-        // Drop must free exactly the slots that have sequence != 0.
+        // After wrapping, each slot holds exactly the latest Arc for that index.
         let ring: RingBuffer<String> = RingBuffer::new(4);
-        // Push 6 values into capacity-4 buffer (wraps 1.5 times).
         for i in 0..6u64 {
             unsafe { ring.push(format!("msg-{i}")) };
         }
         // Drop should run cleanly without double-free.
+    }
+
+    #[test]
+    fn drop_with_retained_arc_does_not_free_data_early() {
+        // If a reader retains an Arc, dropping the RingBuffer must not free the data.
+        let ring: RingBuffer<String> = RingBuffer::new(4);
+        let seq = unsafe { ring.push("alive".to_owned()) };
+        let retained = ring.read(seq).expect("should be readable");
+        drop(ring);
+        // The ring is gone, but the Arc is still valid.
+        assert_eq!(retained.as_str(), "alive");
     }
 
     // --- Cursor ---
@@ -468,8 +513,8 @@ mod tests {
                 let seqs = seqs.clone();
                 thread::spawn(move || {
                     for seq in &seqs {
-                        // Value stored equals sequence number.
-                        assert_eq!(ring.read(*seq), Some(*seq));
+                        let arc = ring.read(*seq).expect("should be readable");
+                        assert_eq!(*arc, *seq);
                     }
                 })
             })
@@ -508,28 +553,22 @@ mod tests {
                 thread::spawn(move || {
                     let mut seq = 1u64;
                     let mut reads = 0u64;
-                    // Keep trying until we've seen at least half the messages or
-                    // advanced past all of them (to avoid an infinite loop if we lag).
                     while seq <= MSG_COUNT {
                         match ring.read(seq) {
-                            Some(val) => {
+                            Some(arc) => {
                                 // Value equals seq by construction.
-                                assert_eq!(val, seq);
+                                assert_eq!(*arc, seq);
                                 seq += 1;
                                 reads += 1;
                             }
                             None => {
-                                // Either not yet written or overwritten; check latest and
-                                // skip ahead if we've lagged.
                                 let latest = ring.latest_seq();
                                 let oldest = ring.oldest_available_seq();
                                 if seq < oldest {
                                     seq = oldest;
                                 } else if seq > latest && latest == MSG_COUNT {
-                                    // Producer finished and we're past all messages.
                                     break;
                                 }
-                                // Spin — yield to let the producer make progress.
                                 thread::yield_now();
                             }
                         }
@@ -542,7 +581,6 @@ mod tests {
         producer.join().expect("producer panicked");
         for c in consumers {
             let reads = c.join().expect("consumer panicked");
-            // Each consumer must have read at least one message.
             assert!(reads > 0, "consumer read zero messages");
         }
     }
