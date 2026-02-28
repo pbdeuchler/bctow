@@ -87,9 +87,8 @@ impl<T: Send + Sync + 'static> ConsumerClient<T> {
     pub fn unsubscribe(&mut self, topic: TopicId) {
         self.subscriptions.remove(&topic);
         self.topic_order.retain(|&t| t != topic);
-        // Keep next_poll_idx in bounds.
-        let len = self.topic_order.len();
-        if len > 0 && self.next_poll_idx >= len {
+        // Keep next_poll_idx in bounds (also resets to 0 when list becomes empty).
+        if self.next_poll_idx >= self.topic_order.len() {
             self.next_poll_idx = 0;
         }
     }
