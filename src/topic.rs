@@ -21,7 +21,7 @@ pub trait TopicKey {
 
 /// A topic identified by exact string equality.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ExactTopic(pub String);
+pub struct ExactTopic(pub(crate) String);
 
 impl ExactTopic {
     pub fn new(s: impl Into<String>) -> Self {
@@ -51,6 +51,7 @@ impl TopicKey for &str {
 
 /// Placeholder for future pattern-based matching (prefix, wildcard, …).
 /// Not constructible outside this module.
+#[derive(Debug)]
 pub struct TopicPattern {
     _private: (),
 }
@@ -101,9 +102,12 @@ impl TopicInterner {
             return id;
         }
 
-        let id = TopicId(guard.names.len() as u32);
-        guard.names.push(key.to_owned());
-        guard.map.insert(key.to_owned(), id);
+        let len = guard.names.len();
+        assert!(len <= u32::MAX as usize, "topic interner overflow: exceeded u32::MAX topics");
+        let id = TopicId(len as u32);
+        let owned = key.to_owned();
+        guard.map.insert(owned.clone(), id);
+        guard.names.push(owned);
         id
     }
 
@@ -115,6 +119,9 @@ impl TopicInterner {
     }
 
     /// Reverse lookup: return the topic string for a given `TopicId`.
+    ///
+    /// Allocates a new `String` on each call. Intended for debug and logging
+    /// paths only — do not call on hot paths.
     pub fn name(&self, id: TopicId) -> Option<String> {
         let guard = self.inner.read().expect("topic interner read lock poisoned");
         guard.names.get(id.0 as usize).cloned()
@@ -167,6 +174,13 @@ mod tests {
 
     fn interner() -> TopicInterner {
         TopicInterner::new()
+    }
+
+    #[test]
+    fn default_interner_works() {
+        let ti = TopicInterner::default();
+        let id = ti.intern("x");
+        assert_eq!(ti.resolve("x"), Some(id));
     }
 
     #[test]
