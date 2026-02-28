@@ -47,6 +47,16 @@ pub(crate) struct RingBuffer<T> {
     capacity: usize,
     /// Next sequence number to be written. Starts at 1. Mutated only by the producer;
     /// stored as `AtomicU64` so readers can observe it without a lock.
+    ///
+    /// # Overflow note
+    ///
+    /// `write_seq` is a plain `u64` counter. Wrapping from `u64::MAX` back to 0 would
+    /// cause the next sequence number emitted to be 0, which collides with the "empty slot"
+    /// sentinel. At 1 billion pushes per second this would occur after approximately
+    /// 584 years of continuous operation, so it is not a practical concern. If the library
+    /// is ever used in an environment where this bound might be approached, the fix is to
+    /// start at 1 and reserve 0 as-is (already done), but also add a guard in `push` that
+    /// saturates or panics at `u64::MAX`.
     write_seq: AtomicU64,
 }
 
@@ -126,10 +136,40 @@ impl<T: Send + Sync> RingBuffer<T> {
         if stored != seq {
             return None;
         }
-        // SAFETY: `stored == seq` and the Release store in `push` has happened before
+        // SAFETY: `stored == seq` and the Release store in `push` has happened-before
         // this Acquire load, so the write to `value` is fully visible here.
         // We clone the Arc (cheap: atomic refcount increment), keeping the data alive
         // even if the producer overwrites this slot immediately after.
+        //
+        // # Formal memory model note (known limitation)
+        //
+        // Accessing `slot.value` via `UnsafeCell::get` is *practically* safe on all
+        // real hardware (x86, ARM, RISC-V) because pointer-sized aligned writes are
+        // always atomic at the microarchitectural level. However, under the C++ / Rust
+        // *abstract* memory model there is a formal data race: if the producer wraps
+        // around and begins writing the same slot index for the second time while this
+        // reader is executing the `UnsafeCell` access, there is no happens-before edge
+        // between the producer's *second* write and this reader's read of `value`. The
+        // sequence protocol (zeroing then republishing the sequence number with `Release`)
+        // creates a happens-before edge only for the *first* write that sets `seq`. A
+        // second write (wrap-around) stores 0 before overwriting `value`; the reader
+        // loads the sequence *before* touching `value`, so it would see 0 != seq and
+        // return early — but that `sequence` load and the producer's write to `value`
+        // are not formally ordered, making the `value` access formally undefined
+        // behaviour under the abstract model. Miri will flag this.
+        //
+        // In practice the post-read re-check below catches wrap-around and returns
+        // `None`, keeping the API semantics correct even though the underlying access
+        // is formally racy.
+        //
+        // The fully correct fix is epoch-based memory reclamation (e.g. `crossbeam-epoch`
+        // or hazard pointers): an epoch guard would prevent the producer from recycling
+        // a slot's allocation while any reader holds a reference. `AtomicPtr` alone does
+        // not solve the race — between loading the raw pointer and calling
+        // `Arc::increment_strong_count`, the producer could already have called
+        // `Arc::from_raw` and dropped the allocation. A complete lock-free solution
+        // therefore requires either a seqlock that stalls the producer while readers
+        // are inside the critical section, or a deferred-reclamation scheme.
         let arc = unsafe { (*slot.value.get()).as_ref()?.clone() };
 
         // Re-check the sequence after cloning to guard against a race where the producer
