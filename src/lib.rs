@@ -6,6 +6,7 @@ pub(crate) mod broker;
 pub mod producer;
 pub mod consumer;
 
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use broker::BrokerInner;
@@ -21,11 +22,12 @@ pub use consumer::Metrics;
 
 /// Create a matched `Producer` + `ConsumerContext` pair sharing the same broker state.
 pub fn broker<T: Send + Sync + 'static>(config: BctowConfig) -> (Producer<T>, ConsumerContext<T>) {
-    let overflow_policy = config.overflow_policy.clone();
+    let overflow_policy = config.overflow_policy;
     let inner = Arc::new(BrokerInner::new(config));
     (
         Producer {
             inner: Arc::clone(&inner),
+            _not_sync: PhantomData,
         },
         ConsumerContext::new(inner, overflow_policy),
     )

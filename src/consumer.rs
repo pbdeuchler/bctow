@@ -26,7 +26,7 @@ impl<T: Send + Sync + 'static> ConsumerContext<T> {
     pub fn create_client(&self) -> ConsumerClient<T> {
         ConsumerClient {
             inner: Arc::clone(&self.inner),
-            overflow_policy: self.overflow_policy.clone(),
+            overflow_policy: self.overflow_policy,
             subscriptions: HashMap::new(),
             topic_order: Vec::new(),
             next_poll_idx: 0,
@@ -62,16 +62,18 @@ impl<T: Send + Sync + 'static> ConsumerClient<T> {
     pub fn subscribe(&mut self, topic: &str) -> Result<(), BctowError> {
         match self.inner.interner.resolve(topic) {
             Some(id) => self.subscribe_id(id),
-            None => Err(BctowError::TopicNotFound(crate::topic::TopicId(u32::MAX))),
+            None => Err(BctowError::TopicNotFound(topic.to_owned())),
         }
     }
 
     /// Subscribe to a known `TopicId`.
+    ///
+    /// Subscribing to the same topic twice is a no-op.
     pub fn subscribe_id(&mut self, topic: TopicId) -> Result<(), BctowError> {
         let ring = self
             .inner
             .get_ring(topic)
-            .ok_or(BctowError::TopicNotFound(topic))?;
+            .ok_or_else(|| BctowError::TopicNotFound(format!("{topic:?}")))?;
 
         if !self.subscriptions.contains_key(&topic) {
             let cursor = Cursor::new_latest(&ring);
@@ -92,6 +94,16 @@ impl<T: Send + Sync + 'static> ConsumerClient<T> {
         }
     }
 
+    /// Remove subscription for the topic identified by `topic` name.
+    ///
+    /// If the topic name has never been interned (i.e. no message has ever been
+    /// published to it), this is a no-op.
+    pub fn unsubscribe_by_name(&mut self, topic: &str) {
+        if let Some(id) = self.inner.interner.resolve(topic) {
+            self.unsubscribe(id);
+        }
+    }
+
     /// Poll for the next available message across all subscribed topics.
     ///
     /// Returns `(TopicId, Arc<T>)` for the first available message, using a rotating
@@ -103,7 +115,6 @@ impl<T: Send + Sync + 'static> ConsumerClient<T> {
         }
 
         let start = self.next_poll_idx % count;
-        self.next_poll_idx = (start + 1) % count;
 
         for i in 0..count {
             let idx = (start + i) % count;
@@ -112,11 +123,15 @@ impl<T: Send + Sync + 'static> ConsumerClient<T> {
             // We need mutable access to the cursor but also need the ring ref.
             // Borrow from the hashmap directly.
             let result = {
-                let (cursor, ring) = self.subscriptions.get_mut(&topic_id)?;
-                try_read_with_policy(cursor, ring, &self.overflow_policy)
+                let (cursor, ring) = self.subscriptions.get_mut(&topic_id)
+                    .expect("topic_order and subscriptions out of sync");
+                try_read_with_policy(cursor, ring, self.overflow_policy)
             };
 
             if let Some(arc) = result {
+                // Only advance the round-robin index when a message is actually found.
+                // This prevents unfair starvation where idx advances even on a miss.
+                self.next_poll_idx = (idx + 1) % count;
                 #[cfg(feature = "metrics")]
                 self.inner.inc_delivered();
                 return Some((topic_id, arc));
@@ -131,7 +146,7 @@ impl<T: Send + Sync + 'static> ConsumerClient<T> {
 fn try_read_with_policy<T: Send + Sync + 'static>(
     cursor: &mut Cursor,
     ring: &RingBuffer<T>,
-    policy: &OverflowPolicy,
+    policy: OverflowPolicy,
 ) -> Option<Arc<T>> {
     let seq = cursor.next_seq();
 
@@ -143,19 +158,16 @@ fn try_read_with_policy<T: Send + Sync + 'static>(
 
     // Read returned None. Determine why.
     let latest = ring.latest_seq();
-    let oldest = ring.oldest_available_seq();
-
-    if latest == 0 {
-        // Nothing written yet.
-        return None;
-    }
 
     if seq > latest {
         // Consumer is ahead of the producer — nothing new to read.
+        // Also covers the case where latest == 0 (nothing written yet):
+        // seq starts at 1 > 0, so this branch fires correctly.
         return None;
     }
 
     // Consumer has lagged: seq < oldest_available.
+    let oldest = ring.oldest_available_seq();
     match policy {
         OverflowPolicy::DropOldest => {
             // Skip to oldest available and try once more.
@@ -205,7 +217,7 @@ mod tests {
     fn read_policy_empty_ring_returns_none() {
         let ring = make_ring(4);
         let mut cursor = Cursor::new();
-        let result = try_read_with_policy(&mut cursor, &ring, &OverflowPolicy::DropOldest);
+        let result = try_read_with_policy(&mut cursor, &ring, OverflowPolicy::DropOldest);
         assert!(result.is_none());
         assert_eq!(cursor.next_seq(), 1); // cursor unchanged
     }
@@ -215,7 +227,7 @@ mod tests {
         let ring = make_ring(4);
         push(&ring, 42);
         let mut cursor = Cursor::new();
-        let result = try_read_with_policy(&mut cursor, &ring, &OverflowPolicy::DropOldest);
+        let result = try_read_with_policy(&mut cursor, &ring, OverflowPolicy::DropOldest);
         assert_eq!(result.map(|a| *a), Some(42));
         assert_eq!(cursor.next_seq(), 2);
     }
@@ -226,7 +238,7 @@ mod tests {
         push(&ring, 1);
         let mut cursor = Cursor::new_latest(&ring);
         // cursor is at seq 2, latest is 1 — nothing new
-        let result = try_read_with_policy(&mut cursor, &ring, &OverflowPolicy::DropOldest);
+        let result = try_read_with_policy(&mut cursor, &ring, OverflowPolicy::DropOldest);
         assert!(result.is_none());
         assert_eq!(cursor.next_seq(), 2); // unchanged
     }
@@ -236,7 +248,7 @@ mod tests {
         let ring = make_ring(4);
         for i in 1u64..=6 { push(&ring, i); } // seqs 1-6; oldest=3
         let mut cursor = Cursor::new(); // stuck at seq=1 which is overwritten
-        let result = try_read_with_policy(&mut cursor, &ring, &OverflowPolicy::DropOldest);
+        let result = try_read_with_policy(&mut cursor, &ring, OverflowPolicy::DropOldest);
         assert!(result.is_some());
         assert!(*result.unwrap() >= 3);
         assert_eq!(cursor.next_seq(), ring.oldest_available_seq() + 1);
@@ -247,7 +259,7 @@ mod tests {
         let ring = make_ring(4);
         for i in 1u64..=6 { push(&ring, i); } // oldest=3, latest=6
         let mut cursor = Cursor::new(); // stuck at seq=1
-        let result = try_read_with_policy(&mut cursor, &ring, &OverflowPolicy::SkipToLatest);
+        let result = try_read_with_policy(&mut cursor, &ring, OverflowPolicy::SkipToLatest);
         assert!(result.is_none()); // nothing returned; consumer skipped ahead
         assert_eq!(cursor.next_seq(), 7); // latest+1
     }
@@ -257,7 +269,7 @@ mod tests {
         let ring = make_ring(4);
         for i in 1u64..=6 { push(&ring, i); } // oldest=3
         let mut cursor = Cursor::new(); // stuck at seq=1
-        let result = try_read_with_policy(&mut cursor, &ring, &OverflowPolicy::DropNewest);
+        let result = try_read_with_policy(&mut cursor, &ring, OverflowPolicy::DropNewest);
         assert!(result.is_none());
         assert_eq!(cursor.next_seq(), 1); // cursor unchanged
     }

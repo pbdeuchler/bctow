@@ -54,13 +54,13 @@ fn single_producer_single_consumer_order_preserved_string_path() {
     let (prod, ctx) = default_broker::<u64>();
 
     // Prime: creates the ring. subscribe() requires the ring to exist.
-    prod.publish("ordered", 0).unwrap();
+    prod.publish("ordered", 0);
 
     let mut client = ctx.create_client();
     client.subscribe("ordered").unwrap();
 
     for i in 1u64..=5 {
-        prod.publish("ordered", i).unwrap();
+        prod.publish("ordered", i);
     }
 
     let msgs = drain(&mut client);
@@ -74,15 +74,15 @@ fn single_producer_single_consumer_publish_id_path() {
     let (prod, ctx) = default_broker::<u64>();
 
     // Prime the topic with a known sentinel value.
-    let seq1 = prod.publish("events", 999).unwrap();
+    let seq1 = prod.publish("events", 999);
     assert_eq!(seq1, 1, "first publish must return sequence 1");
 
     let mut client = ctx.create_client();
     client.subscribe("events").unwrap();
 
     // Publish via string; collect returned sequences.
-    let s2 = prod.publish("events", 10).unwrap();
-    let s3 = prod.publish("events", 20).unwrap();
+    let s2 = prod.publish("events", 10);
+    let s3 = prod.publish("events", 20);
     assert_eq!(s2, 2);
     assert_eq!(s3, 3);
 
@@ -92,9 +92,9 @@ fn single_producer_single_consumer_publish_id_path() {
 
     // Now use the TopicId obtained from poll() to publish via publish_id.
     let topic_id = msgs[0].0;
-    let s4 = prod.publish_id(topic_id, 30).unwrap();
+    let s4 = prod.publish_id(topic_id, 30);
     assert_eq!(s4, 4);
-    prod.publish_id(topic_id, 40).unwrap();
+    prod.publish_id(topic_id, 40);
 
     let more = drain(&mut client);
     let more_values: Vec<u64> = more.iter().map(|(_, v)| **v).collect();
@@ -106,7 +106,7 @@ fn single_producer_single_consumer_publish_id_path() {
 fn publish_returns_increasing_sequence_numbers() {
     let (prod, _ctx) = default_broker::<u64>();
     let seqs: Vec<u64> = (1u64..=5)
-        .map(|i| prod.publish("seq-test", i).unwrap())
+        .map(|i| prod.publish("seq-test", i))
         .collect();
     assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
 }
@@ -125,7 +125,7 @@ fn single_producer_many_consumers_all_receive_independently() {
     let (prod, ctx) = default_broker::<u64>();
 
     // Prime so subscribe works.
-    prod.publish("broadcast", 0).unwrap();
+    prod.publish("broadcast", 0);
 
     // Create all clients and subscribe before publishing the test messages.
     let clients: Vec<_> = (0..NUM_CONSUMERS)
@@ -138,7 +138,7 @@ fn single_producer_many_consumers_all_receive_independently() {
 
     // Publish test payload.
     for i in 1..=MSG_COUNT {
-        prod.publish("broadcast", i).unwrap();
+        prod.publish("broadcast", i);
     }
 
     // Each client drains in its own thread.
@@ -169,7 +169,7 @@ fn single_producer_many_consumers_all_receive_independently() {
 fn cloned_consumer_context_creates_independent_clients() {
     let (prod, ctx) = default_broker::<u64>();
 
-    prod.publish("clone-test", 0).unwrap();
+    prod.publish("clone-test", 0);
 
     let ctx2 = ctx.clone();
 
@@ -179,8 +179,8 @@ fn cloned_consumer_context_creates_independent_clients() {
     c1.subscribe("clone-test").unwrap();
     c2.subscribe("clone-test").unwrap();
 
-    prod.publish("clone-test", 1).unwrap();
-    prod.publish("clone-test", 2).unwrap();
+    prod.publish("clone-test", 1);
+    prod.publish("clone-test", 2);
 
     let v1: Vec<u64> = drain(&mut c1).into_iter().map(|(_, v)| *v).collect();
     let v2: Vec<u64> = drain(&mut c2).into_iter().map(|(_, v)| *v).collect();
@@ -201,16 +201,16 @@ fn dynamic_subscribe_unsubscribe() {
     let (prod, ctx) = default_broker::<&'static str>();
 
     // Prime both topics.
-    prod.publish("a", "a-prime").unwrap();
-    prod.publish("b", "b-prime").unwrap();
+    prod.publish("a", "a-prime");
+    prod.publish("b", "b-prime");
 
     let mut client = ctx.create_client();
     client.subscribe("a").unwrap();
 
     // Phase 1: subscribed to A only.
-    prod.publish("a", "a1").unwrap();
-    prod.publish("b", "b1").unwrap();
-    prod.publish("a", "a2").unwrap();
+    prod.publish("a", "a1");
+    prod.publish("b", "b1");
+    prod.publish("a", "a2");
 
     let phase1 = drain(&mut client);
     let values1: Vec<&str> = phase1.iter().map(|(_, v)| **v).collect();
@@ -221,8 +221,8 @@ fn dynamic_subscribe_unsubscribe() {
 
     // Phase 2: subscribe to B as well.
     client.subscribe("b").unwrap();
-    prod.publish("a", "a3").unwrap();
-    prod.publish("b", "b2").unwrap();
+    prod.publish("a", "a3");
+    prod.publish("b", "b2");
 
     let phase2 = drain(&mut client);
     let ids2: Vec<TopicId> = phase2.iter().map(|(id, _)| *id).collect();
@@ -235,8 +235,8 @@ fn dynamic_subscribe_unsubscribe() {
 
     // Phase 3: unsubscribe from A.
     client.unsubscribe(id_a);
-    prod.publish("a", "a4").unwrap();
-    prod.publish("b", "b3").unwrap();
+    prod.publish("a", "a4");
+    prod.publish("b", "b3");
 
     let phase3 = drain(&mut client);
     let ids3: Vec<TopicId> = phase3.iter().map(|(id, _)| *id).collect();
@@ -246,6 +246,36 @@ fn dynamic_subscribe_unsubscribe() {
         "phase 3: only B messages expected after unsubscribing A"
     );
     assert_eq!(values3, vec!["b3"]);
+}
+
+/// unsubscribe_by_name removes a subscription the same as unsubscribe(TopicId).
+#[test]
+fn unsubscribe_by_name_removes_subscription() {
+    let (prod, ctx) = default_broker::<u64>();
+
+    prod.publish("named", 0);
+
+    let mut client = ctx.create_client();
+    client.subscribe("named").unwrap();
+
+    prod.publish("named", 1);
+    let msgs = drain(&mut client);
+    assert_eq!(msgs.len(), 1);
+
+    client.unsubscribe_by_name("named");
+
+    prod.publish("named", 2);
+    let after = drain(&mut client);
+    assert!(after.is_empty(), "no messages expected after unsubscribe_by_name");
+}
+
+/// unsubscribe_by_name on an unknown topic is a no-op (no panic).
+#[test]
+fn unsubscribe_by_name_unknown_topic_is_noop() {
+    let (_prod, ctx) = default_broker::<u64>();
+    let mut client = ctx.create_client();
+    // Must not panic.
+    client.unsubscribe_by_name("never-published");
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +289,7 @@ fn overflow_drop_oldest_skips_to_oldest_available() {
     let (prod, ctx) = small_broker::<u64>(4, OverflowPolicy::DropOldest);
 
     // Prime the topic.
-    prod.publish("lag", 0).unwrap();
+    prod.publish("lag", 0);
 
     let mut client = ctx.create_client();
     client.subscribe("lag").unwrap();
@@ -267,7 +297,7 @@ fn overflow_drop_oldest_skips_to_oldest_available() {
     // Flood: push 8 messages into a capacity-4 ring without polling.
     // After 8 pushes, oldest available = 8 - 4 + 1 = 5.
     for i in 1u64..=8 {
-        prod.publish("lag", i).unwrap();
+        prod.publish("lag", i);
     }
 
     // DropOldest must return the oldest still-available message (not None).
@@ -290,14 +320,14 @@ fn overflow_drop_oldest_skips_to_oldest_available() {
 fn overflow_skip_to_latest_returns_none_then_receives_new() {
     let (prod, ctx) = small_broker::<u64>(4, OverflowPolicy::SkipToLatest);
 
-    prod.publish("skip", 0).unwrap();
+    prod.publish("skip", 0);
 
     let mut client = ctx.create_client();
     client.subscribe("skip").unwrap();
 
     // Flood 8 messages — consumer has lagged past the entire ring.
     for i in 1u64..=8 {
-        prod.publish("skip", i).unwrap();
+        prod.publish("skip", i);
     }
 
     // First poll after lag: returns None and advances cursor to latest+1.
@@ -308,8 +338,8 @@ fn overflow_skip_to_latest_returns_none_then_receives_new() {
     );
 
     // Messages published after the cursor reset must be received.
-    prod.publish("skip", 99).unwrap();
-    prod.publish("skip", 100).unwrap();
+    prod.publish("skip", 99);
+    prod.publish("skip", 100);
 
     let after: Vec<u64> = drain(&mut client).into_iter().map(|(_, v)| *v).collect();
     assert_eq!(
@@ -324,14 +354,14 @@ fn overflow_skip_to_latest_returns_none_then_receives_new() {
 fn overflow_drop_newest_cursor_stays_put() {
     let (prod, ctx) = small_broker::<u64>(4, OverflowPolicy::DropNewest);
 
-    prod.publish("drop", 0).unwrap();
+    prod.publish("drop", 0);
 
     let mut client = ctx.create_client();
     client.subscribe("drop").unwrap();
 
     // Flood past capacity.
     for i in 1u64..=8 {
-        prod.publish("drop", i).unwrap();
+        prod.publish("drop", i);
     }
 
     // Every poll must return None — cursor doesn't move.
@@ -369,10 +399,10 @@ fn subscribe_nonexistent_topic_by_name_returns_topic_not_found() {
 fn subscribe_id_for_unknown_ring_returns_topic_not_found() {
     // Broker A: create a topic and publish a message so subscribe + poll works.
     let (prod_a, ctx_a) = default_broker::<u64>();
-    prod_a.publish("foreign", 0).unwrap();  // prime
+    prod_a.publish("foreign", 0);  // prime
     let mut tmp = ctx_a.create_client();
     tmp.subscribe("foreign").unwrap();
-    prod_a.publish("foreign", 1).unwrap();
+    prod_a.publish("foreign", 1);
     // Obtain a TopicId from a received message.
     let foreign_id = tmp.poll().unwrap().0;
 
@@ -398,8 +428,86 @@ fn poll_with_no_subscriptions_returns_none() {
     );
 }
 
+/// TopicNotFound error carries the topic name string for string-based lookups.
+#[test]
+fn topic_not_found_error_carries_topic_name() {
+    let (_prod, ctx) = default_broker::<u64>();
+    let mut client = ctx.create_client();
+    let err = client.subscribe("my-missing-topic").unwrap_err();
+    match err {
+        BctowError::TopicNotFound(desc) => {
+            assert!(
+                desc.contains("my-missing-topic"),
+                "error description should contain the topic name, got: {desc}"
+            );
+        }
+        _ => panic!("expected TopicNotFound, got: {:?}", err),
+    }
+}
+
 // ---------------------------------------------------------------------------
-// 6. Metrics (feature-gated)
+// 6. Subscribe idempotency
+// ---------------------------------------------------------------------------
+
+/// Subscribing to the same topic twice does not duplicate messages.
+#[test]
+fn subscribe_twice_does_not_duplicate_messages() {
+    let (prod, ctx) = default_broker::<u64>();
+
+    // Prime the topic.
+    prod.publish("idem", 0);
+
+    let mut client = ctx.create_client();
+
+    // Subscribe to the same topic twice — second call must be a no-op.
+    client.subscribe("idem").unwrap();
+    client.subscribe("idem").unwrap();
+
+    prod.publish("idem", 1);
+    prod.publish("idem", 2);
+    prod.publish("idem", 3);
+
+    let msgs = drain(&mut client);
+    let values: Vec<u64> = msgs.iter().map(|(_, v)| **v).collect();
+
+    assert_eq!(
+        values,
+        vec![1, 2, 3],
+        "subscribing twice must not cause duplicate message delivery"
+    );
+}
+
+/// subscribe_id twice is also a no-op.
+#[test]
+fn subscribe_id_twice_does_not_duplicate_messages() {
+    let (prod, ctx) = default_broker::<u64>();
+
+    prod.publish("idem2", 0);
+
+    let mut client = ctx.create_client();
+    client.subscribe("idem2").unwrap();
+
+    // Resolve the TopicId and subscribe by ID twice.
+    prod.publish("idem2", 1);
+    let (topic_id, _) = client.poll().unwrap();
+
+    // Re-subscribe by ID — must be no-op.
+    client.subscribe_id(topic_id).unwrap();
+
+    prod.publish("idem2", 2);
+    prod.publish("idem2", 3);
+
+    let msgs = drain(&mut client);
+    let values: Vec<u64> = msgs.iter().map(|(_, v)| **v).collect();
+    assert_eq!(
+        values,
+        vec![2, 3],
+        "subscribe_id twice must not cause duplicate delivery"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Metrics (feature-gated)
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "metrics")]
@@ -412,13 +520,13 @@ mod metrics_tests {
         const N: u64 = 10;
 
         // Prime.
-        prod.publish("m", 0).unwrap();
+        prod.publish("m", 0);
 
         let mut client = ctx.create_client();
         client.subscribe("m").unwrap();
 
         for i in 1..=N {
-            prod.publish("m", i).unwrap();
+            prod.publish("m", i);
         }
 
         let delivered_msgs = drain(&mut client);
@@ -436,7 +544,7 @@ mod metrics_tests {
     #[test]
     fn metrics_delivered_zero_when_no_polls() {
         let (prod, ctx) = default_broker::<u64>();
-        prod.publish("m2", 42).unwrap();
+        prod.publish("m2", 42);
 
         let m = ctx.metrics();
         assert_eq!(m.messages_published, 1);
@@ -447,15 +555,15 @@ mod metrics_tests {
     fn metrics_accumulate_across_multiple_topics() {
         let (prod, ctx) = default_broker::<u64>();
 
-        prod.publish("t1", 0).unwrap();
-        prod.publish("t2", 0).unwrap();
+        prod.publish("t1", 0);
+        prod.publish("t2", 0);
 
         let mut c1 = ctx.create_client();
         c1.subscribe("t1").unwrap();
         c1.subscribe("t2").unwrap();
 
-        prod.publish("t1", 1).unwrap();
-        prod.publish("t2", 2).unwrap();
+        prod.publish("t1", 1);
+        prod.publish("t2", 2);
 
         let n = drain(&mut c1).len() as u64;
 
@@ -466,7 +574,7 @@ mod metrics_tests {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Multi-threaded producer + consumers
+// 8. Multi-threaded producer + consumers
 // ---------------------------------------------------------------------------
 
 /// Producer on one thread, 4 consumers on separate threads. Each consumer
@@ -485,7 +593,7 @@ fn multithreaded_producer_and_consumers_no_panics() {
     });
 
     // Prime the topic before spawning anything.
-    prod.publish("shared", 0).unwrap();
+    prod.publish("shared", 0);
 
     // Create and subscribe all consumers before starting the producer.
     let clients: Vec<_> = (0..NUM_CONSUMERS)
@@ -499,7 +607,7 @@ fn multithreaded_producer_and_consumers_no_panics() {
     // Spawn the producer on its own thread.
     let producer_handle = thread::spawn(move || {
         for i in 1..=MSG_COUNT {
-            prod.publish("shared", i).unwrap();
+            prod.publish("shared", i);
         }
     });
 
@@ -533,7 +641,7 @@ fn multithreaded_truly_concurrent_producer_and_consumers() {
         ..BctowConfig::default()
     });
 
-    prod.publish("concurrent", 0).unwrap();
+    prod.publish("concurrent", 0);
 
     let clients: Vec<_> = (0..NUM_CONSUMERS)
         .map(|_| {
@@ -566,7 +674,7 @@ fn multithreaded_truly_concurrent_producer_and_consumers() {
     // Producer thread.
     let producer_handle = thread::spawn(move || {
         for i in 1..=MSG_COUNT {
-            prod.publish("concurrent", i).unwrap();
+            prod.publish("concurrent", i);
         }
     });
 

@@ -206,6 +206,9 @@ impl<T: Send + Sync> RingBuffer<T> {
     }
 
     /// Number of slots.
+    ///
+    /// Intended for use by examples and documentation to display ring sizes.
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
@@ -226,6 +229,11 @@ pub(crate) struct Cursor {
 
 impl Cursor {
     /// Start at the beginning: will attempt to read sequence 1 first.
+    ///
+    /// Useful for replaying all messages from the beginning of the ring.
+    /// Future API surface: callers may request a cursor starting at sequence 1
+    /// to access historical messages within the buffer window.
+    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Cursor { next_seq: 1 }
     }
