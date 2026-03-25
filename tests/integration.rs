@@ -447,7 +447,7 @@ fn custom_copy_struct_publish_and_receive() {
 #[test]
 fn fixed_bytes_roundtrip_through_broker() {
     const N: usize = 64;
-    let payloads: &[&[u8]] = &[b"hello", b"world", b"", b"exactly 64 bytes?", b"\x00\xFF\xAB"];
+    let messages: &[&[u8]] = &[b"hello", b"world", b"", b"exactly 64 bytes?", b"\x00\xFF\xAB"];
 
     let (producer, ctx) = broker::<FixedBytes<N>>(BctowConfig::default());
 
@@ -459,9 +459,9 @@ fn fixed_bytes_roundtrip_through_broker() {
     let mut client = ctx.create_client();
     client.subscribe("bytes").unwrap();
 
-    for payload in payloads {
+    for msg in messages {
         producer
-            .publish("bytes", &FixedBytes::<N>::new(payload).unwrap())
+            .publish("bytes", &FixedBytes::<N>::new(msg).unwrap())
             .unwrap();
     }
 
@@ -473,7 +473,7 @@ fn fixed_bytes_roundtrip_through_broker() {
         out
     };
 
-    let expected: Vec<Vec<u8>> = payloads.iter().map(|p| p.to_vec()).collect();
+    let expected: Vec<Vec<u8>> = messages.iter().map(|p| p.to_vec()).collect();
     assert_eq!(received, expected);
 }
 

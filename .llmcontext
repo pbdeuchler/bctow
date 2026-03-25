@@ -54,4 +54,4 @@ bctow: generic typed pub/sub ring buffer library (Rust)
 - src/consumer.rs: ConsumerContext<T>, ConsumerClient<T>, ReceivedMessage<'a,T>, try_read_with_policy
 - src/lib.rs: pub broker<T>() fn, re-exports
 - tests/integration.rs: most tests use u64; SensorReading (Copy struct) and FixedBytes<64> also covered
-- examples/basic.rs: broker::<u64> demo
+- examples/basic.rs: broker::<SensorReading> demo

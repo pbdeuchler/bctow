@@ -37,9 +37,10 @@ pub(crate) struct RingBuffer<T> {
 }
 
 // SAFETY: The ring enforces single-writer access at the API boundary and uses
-// atomics to coordinate concurrent readers.
+// atomics to coordinate concurrent readers. Data is concurrently read by multiple
+// threads, so T must be both Send and Sync.
 unsafe impl<T: Send> Send for RingBuffer<T> {}
-unsafe impl<T: Sync> Sync for RingBuffer<T> {}
+unsafe impl<T: Send + Sync> Sync for RingBuffer<T> {}
 
 impl<T: Copy> RingBuffer<T> {
     pub(crate) fn new(capacity: usize) -> Self {
@@ -312,5 +313,13 @@ mod tests {
             ring.read_into(*seq, &mut dst).unwrap();
             assert_eq!(unsafe { dst.assume_init() }, points[i]);
         }
+    }
+
+    #[test]
+    fn read_into_seq_zero_returns_none() {
+        let ring = RingBuffer::<u64>::new(4);
+        ring.push(&42);
+        let mut dst = MaybeUninit::uninit();
+        assert!(ring.read_into(0, &mut dst).is_none());
     }
 }
