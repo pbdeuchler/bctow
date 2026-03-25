@@ -4,7 +4,7 @@ Buffalo Chicken Tender on White, now as a generic typed topic pub/sub library fo
 
 ## What changed
 
-- Payloads are generic typed values, not byte slices, so the compiler ensures type safety across publish and subscribe.
+- Messages are generic typed values, not byte slices, so the compiler ensures type safety across publish and subscribe.
 - Topic ids are broker-branded, so a `TopicId` from one broker is rejected by another.
 - Topic rings preallocate slot storage and copy typed values into those slots instead of allocating an `Arc` per message.
 - Consumers copy into an internal scratch buffer with `poll()` or a caller-provided buffer with `poll_into()`.

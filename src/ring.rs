@@ -28,7 +28,7 @@ impl<T> Slot<T> {
 unsafe impl<T: Send> Send for Slot<T> {}
 unsafe impl<T: Sync> Sync for Slot<T> {}
 
-/// Single-producer, multiple-consumer ring buffer for typed payloads.
+/// Single-producer, multiple-consumer ring buffer for typed values.
 pub(crate) struct RingBuffer<T> {
     slots: Box<[Slot<T>]>,
     capacity: usize,
@@ -183,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn read_overwritten_payload_returns_none() {
+    fn read_overwritten_value_returns_none() {
         let ring = RingBuffer::<u64>::new(2);
         ring.push(&1u64);
         ring.push(&2u64);
