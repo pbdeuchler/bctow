@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -122,7 +121,6 @@ pub(crate) struct TopicRegistry<T> {
     broker_id: u64,
     ring_buffer_capacity: usize,
     inner: RwLock<RegistryInner<T>>,
-    _marker: PhantomData<T>,
 }
 
 impl<T: Copy + Send + Sync + 'static> TopicRegistry<T> {
@@ -134,7 +132,6 @@ impl<T: Copy + Send + Sync + 'static> TopicRegistry<T> {
                 by_name: HashMap::new(),
                 topics: Vec::new(),
             }),
-            _marker: PhantomData,
         }
     }
 
