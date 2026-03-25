@@ -34,7 +34,7 @@ fn main() -> Result<(), bctow::BctowError> {
 Run the example with:
 
 ```bash
-cargo run --example basic
+cargo run --all-features --example basic
 ```
 
 ## Design notes
@@ -44,6 +44,19 @@ cargo run --example basic
 - No broker lock on steady-state `publish_id` after the producer caches the topic.
 - No allocations in steady-state publish or receive paths.
 - Overflow policies: `DropOldest`, `DropNewest`, `SkipToLatest`.
+
+## Variable-length byte payloads
+
+`FixedBytes<N>` stores up to `N` bytes inline and is `Copy`, so it works as `T`
+in `broker::<FixedBytes<N>>()`. This preserves byte-oriented semantics without
+reintroducing dynamic slot sizing or per-message allocation.
+
+```rust
+use bctow::{broker, BctowConfig, FixedBytes};
+
+let (producer, ctx) = broker::<FixedBytes<64>>(BctowConfig::default());
+producer.publish("events/raw", &FixedBytes::<64>::new(b"hello").unwrap()).unwrap();
+```
 
 ## Optional feature
 

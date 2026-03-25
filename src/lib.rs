@@ -22,6 +22,12 @@
 //! assert_eq!(*msg.message, 43u64);
 //! ```
 //!
+//! ## Byte payloads
+//!
+//! For variable-length byte messages, use `FixedBytes<N>` as `T`. It stores up
+//! to `N` bytes inline and is `Copy`, so it satisfies the broker's type bounds
+//! without per-message allocation.
+//!
 //! ## Architecture
 //!
 //! - One producer thread appends to a shared ring per topic.
