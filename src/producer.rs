@@ -7,13 +7,13 @@ use crate::error::BctowError;
 use crate::topic::{MatchKind, TopicEntry, TopicId, TopicKey};
 
 /// Single-producer handle. `Producer` is `Send` but not `Sync`.
-pub struct Producer {
-    pub(crate) inner: Arc<BrokerInner>,
-    pub(crate) cached_rings: RefCell<Vec<Option<Arc<crate::ring::RingBuffer>>>>,
+pub struct Producer<T> {
+    pub(crate) inner: Arc<BrokerInner<T>>,
+    pub(crate) cached_rings: RefCell<Vec<Option<Arc<crate::ring::RingBuffer<T>>>>>,
     pub(crate) _not_sync: PhantomData<Cell<()>>,
 }
 
-impl Producer {
+impl<T: Copy + Send + Sync + 'static> Producer<T> {
     /// Register `topic` if needed and return its stable broker-branded id.
     pub fn register_topic<K: TopicKey>(&self, topic: K) -> TopicId {
         debug_assert_eq!(topic.match_kind(), MatchKind::Exact);
@@ -22,35 +22,28 @@ impl Producer {
         entry.id()
     }
 
-    /// Publish `payload` to `topic`, creating the topic on first use.
-    pub fn publish<K: TopicKey>(
-        &self,
-        topic: K,
-        payload: impl AsRef<[u8]>,
-    ) -> Result<u64, BctowError> {
+    /// Publish `value` to `topic`, creating the topic on first use.
+    pub fn publish<K: TopicKey>(&self, topic: K, value: &T) -> Result<u64, BctowError> {
         debug_assert_eq!(topic.match_kind(), MatchKind::Exact);
         let entry = self.inner.topics.get_or_create(topic.topic_str());
         self.cache_entry(&entry);
-        self.publish_entry(&entry, payload.as_ref())
+        Ok(self.publish_entry(&entry, value))
     }
 
     /// Publish directly to a known topic id.
     ///
     /// Once a topic has been cached in this producer, steady-state `publish_id`
     /// avoids broker registry locks.
-    pub fn publish_id(&self, topic: TopicId, payload: impl AsRef<[u8]>) -> Result<u64, BctowError> {
+    pub fn publish_id(&self, topic: TopicId, value: &T) -> Result<u64, BctowError> {
         if topic.broker() != self.inner.topics.broker_id() {
             return Err(BctowError::TopicBrokerMismatch(topic));
         }
-
-        let payload = payload.as_ref();
-        self.ensure_payload_size(payload)?;
 
         let index = topic.index() as usize;
         {
             let cache = self.cached_rings.borrow();
             if let Some(Some(ring)) = cache.get(index) {
-                let seq = ring.push(payload);
+                let seq = ring.push(value);
                 #[cfg(feature = "metrics")]
                 self.inner.inc_published();
                 return Ok(seq);
@@ -63,7 +56,7 @@ impl Producer {
             .get(topic)
             .ok_or_else(|| BctowError::TopicNotFound(topic.to_string()))?;
         self.cache_entry(&entry);
-        self.publish_entry(&entry, payload)
+        Ok(self.publish_entry(&entry, value))
     }
 
     /// Resolve a topic id back to its original topic string.
@@ -71,26 +64,14 @@ impl Producer {
         self.inner.topics.name(id)
     }
 
-    fn publish_entry(&self, entry: &Arc<TopicEntry>, payload: &[u8]) -> Result<u64, BctowError> {
-        self.ensure_payload_size(payload)?;
-        let seq = entry.ring().push(payload);
+    fn publish_entry(&self, entry: &Arc<TopicEntry<T>>, value: &T) -> u64 {
+        let seq = entry.ring().push(value);
         #[cfg(feature = "metrics")]
         self.inner.inc_published();
-        Ok(seq)
+        seq
     }
 
-    fn ensure_payload_size(&self, payload: &[u8]) -> Result<(), BctowError> {
-        let max = self.inner.config.max_payload_size;
-        if payload.len() > max {
-            return Err(BctowError::PayloadTooLarge {
-                size: payload.len(),
-                max,
-            });
-        }
-        Ok(())
-    }
-
-    fn cache_entry(&self, entry: &Arc<TopicEntry>) {
+    fn cache_entry(&self, entry: &Arc<TopicEntry<T>>) {
         let index = entry.id().index() as usize;
         let mut cache = self.cached_rings.borrow_mut();
         if cache.len() <= index {

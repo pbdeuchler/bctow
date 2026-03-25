@@ -1,13 +1,13 @@
 # bctow
 
-Buffalo Chicken Tender on White, now as a byte-oriented topic pub/sub library for Rust.
+Buffalo Chicken Tender on White, now as a generic typed topic pub/sub library for Rust.
 
 ## What changed
 
-- Payloads are byte slices, not generic `T`, so `max_payload_size` is enforced on every publish.
+- Messages are generic typed values, not byte slices, so the compiler ensures type safety across publish and subscribe.
 - Topic ids are broker-branded, so a `TopicId` from one broker is rejected by another.
-- Topic rings preallocate slot storage and copy payload bytes into those slots instead of allocating an `Arc` per message.
-- Consumers copy into an internal scratch buffer with `poll()` or a caller-provided buffer with `poll_into()`.
+- Topic rings preallocate slot storage and copy typed values into those slots instead of allocating an `Arc` per message.
+- Consumers copy into an internal scratch buffer with `poll()` or a caller-provided `MaybeUninit<T>` with `poll_into()`.
 
 ## Quick example
 
@@ -15,18 +15,18 @@ Buffalo Chicken Tender on White, now as a byte-oriented topic pub/sub library fo
 use bctow::{broker, BctowConfig};
 
 fn main() -> Result<(), bctow::BctowError> {
-    let (producer, ctx) = broker(BctowConfig::default());
+    let (producer, ctx) = broker::<u64>(BctowConfig::default());
 
     let topic = producer.register_topic("events/sensor");
-    producer.publish_id(topic, b"temp=42")?;
+    producer.publish_id(topic, &42u64)?;
 
     let mut client = ctx.create_client();
     client.subscribe_id(topic)?;
 
-    producer.publish("events/sensor", b"temp=43")?;
+    producer.publish("events/sensor", &43u64)?;
 
     let message = client.poll().unwrap();
-    assert_eq!(message.payload, b"temp=43");
+    assert_eq!(*message.message, 43u64);
     Ok(())
 }
 ```
@@ -34,7 +34,7 @@ fn main() -> Result<(), bctow::BctowError> {
 Run the example with:
 
 ```bash
-cargo run --example basic
+cargo run --all-features --example basic
 ```
 
 ## Design notes
@@ -43,7 +43,23 @@ cargo run --example basic
 - One shared fixed-capacity ring per topic.
 - No broker lock on steady-state `publish_id` after the producer caches the topic.
 - No allocations in steady-state publish or receive paths.
+- `publish` and `publish_id` return `Result<u64, BctowError>` where the `u64` is the slot sequence number.
+- `ConsumerClient` supports `subscribe`/`subscribe_id`, `unsubscribe(TopicId)`, and `unsubscribe_by_name`.
+- Both `Producer` and `ConsumerContext` expose `topic_name(TopicId) -> Option<String>`.
 - Overflow policies: `DropOldest`, `DropNewest`, `SkipToLatest`.
+
+## Variable-length byte payloads
+
+`FixedBytes<N>` stores up to `N` bytes inline and is `Copy`, so it works as `T`
+in `broker::<FixedBytes<N>>()`. This preserves byte-oriented semantics without
+reintroducing dynamic slot sizing or per-message allocation.
+
+```rust
+use bctow::{broker, BctowConfig, FixedBytes};
+
+let (producer, ctx) = broker::<FixedBytes<64>>(BctowConfig::default());
+producer.publish("events/raw", &FixedBytes::<64>::new(b"hello").unwrap()).unwrap();
+```
 
 ## Optional feature
 

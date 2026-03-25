@@ -1,62 +1,53 @@
+use std::mem::MaybeUninit;
 use std::thread;
 
 use bctow::{
-    broker, BctowConfig, BctowError, ConsumerClient, ConsumerContext, ExactTopic, OverflowPolicy,
-    Producer, TopicId,
+    broker, BctowConfig, BctowError, ConsumerClient, ConsumerContext, ExactTopic, FixedBytes,
+    OverflowPolicy, Producer, TopicId,
 };
 
-fn default_broker() -> (Producer, ConsumerContext) {
-    broker(BctowConfig::default())
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct SensorReading {
+    sensor_id: u32,
+    value: f64,
+    timestamp: u64,
+}
+
+fn default_broker() -> (Producer<u64>, ConsumerContext<u64>) {
+    broker::<u64>(BctowConfig::default())
 }
 
 fn small_broker(
     capacity: usize,
-    max_payload_size: usize,
     policy: OverflowPolicy,
-) -> (Producer, ConsumerContext) {
-    broker(BctowConfig {
-        max_payload_size,
+) -> (Producer<u64>, ConsumerContext<u64>) {
+    broker::<u64>(BctowConfig {
         ring_buffer_capacity: capacity,
         overflow_policy: policy,
     })
 }
 
-fn encode_u64(value: u64) -> [u8; 8] {
-    value.to_le_bytes()
-}
-
-fn decode_u64(bytes: &[u8]) -> u64 {
-    u64::from_le_bytes(bytes.try_into().expect("payload must be 8 bytes"))
-}
-
-fn drain(client: &mut ConsumerClient) -> Vec<(TopicId, Vec<u8>)> {
+fn drain(client: &mut ConsumerClient<u64>) -> Vec<(TopicId, u64)> {
     let mut out = Vec::new();
     while let Some(message) = client.poll() {
-        out.push((message.topic_id, message.payload.to_vec()));
+        out.push((message.topic_id, *message.message));
     }
     out
-}
-
-fn drain_u64(client: &mut ConsumerClient) -> Vec<(TopicId, u64)> {
-    drain(client)
-        .into_iter()
-        .map(|(topic_id, payload)| (topic_id, decode_u64(&payload)))
-        .collect()
 }
 
 #[test]
 fn single_producer_single_consumer_order_preserved() {
     let (producer, ctx) = default_broker();
-    producer.publish("ordered", encode_u64(0)).unwrap();
+    producer.publish("ordered", &0u64).unwrap();
 
     let mut client = ctx.create_client();
     client.subscribe("ordered").unwrap();
 
-    for value in 1..=5 {
-        producer.publish("ordered", encode_u64(value)).unwrap();
+    for value in 1u64..=5 {
+        producer.publish("ordered", &value).unwrap();
     }
 
-    let values: Vec<u64> = drain_u64(&mut client)
+    let values: Vec<u64> = drain(&mut client)
         .into_iter()
         .map(|(_, value)| value)
         .collect();
@@ -68,18 +59,18 @@ fn publish_id_path_uses_registered_topic() {
     let (producer, ctx) = default_broker();
     let topic_id = producer.register_topic(ExactTopic::new("events"));
 
-    let seq1 = producer.publish_id(topic_id, encode_u64(10)).unwrap();
-    let seq2 = producer.publish_id(topic_id, encode_u64(20)).unwrap();
+    let seq1 = producer.publish_id(topic_id, &10u64).unwrap();
+    let seq2 = producer.publish_id(topic_id, &20u64).unwrap();
     assert_eq!(seq1, 1);
     assert_eq!(seq2, 2);
 
     let mut client = ctx.create_client();
     client.subscribe_id(topic_id).unwrap();
 
-    producer.publish_id(topic_id, encode_u64(30)).unwrap();
-    producer.publish_id(topic_id, encode_u64(40)).unwrap();
+    producer.publish_id(topic_id, &30u64).unwrap();
+    producer.publish_id(topic_id, &40u64).unwrap();
 
-    let values: Vec<u64> = drain_u64(&mut client)
+    let values: Vec<u64> = drain(&mut client)
         .into_iter()
         .map(|(_, value)| value)
         .collect();
@@ -89,8 +80,8 @@ fn publish_id_path_uses_registered_topic() {
 #[test]
 fn publish_returns_increasing_sequence_numbers() {
     let (producer, _ctx) = default_broker();
-    let seqs: Vec<u64> = (1..=5)
-        .map(|value| producer.publish("seq-test", encode_u64(value)).unwrap())
+    let seqs: Vec<u64> = (1u64..=5)
+        .map(|value| producer.publish("seq-test", &value).unwrap())
         .collect();
     assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
 }
@@ -101,7 +92,7 @@ fn single_producer_many_consumers_all_receive_independently() {
     const NUM_CONSUMERS: usize = 4;
 
     let (producer, ctx) = default_broker();
-    producer.publish("broadcast", encode_u64(0)).unwrap();
+    producer.publish("broadcast", &0u64).unwrap();
 
     let clients: Vec<_> = (0..NUM_CONSUMERS)
         .map(|_| {
@@ -111,15 +102,15 @@ fn single_producer_many_consumers_all_receive_independently() {
         })
         .collect();
 
-    for value in 1..=MSG_COUNT {
-        producer.publish("broadcast", encode_u64(value)).unwrap();
+    for value in 1u64..=MSG_COUNT {
+        producer.publish("broadcast", &value).unwrap();
     }
 
     let handles: Vec<_> = clients
         .into_iter()
         .map(|mut client| {
             thread::spawn(move || {
-                drain_u64(&mut client)
+                drain(&mut client)
                     .into_iter()
                     .map(|(_, value)| value)
                     .collect::<Vec<u64>>()
@@ -135,7 +126,7 @@ fn single_producer_many_consumers_all_receive_independently() {
 #[test]
 fn cloned_context_creates_independent_clients() {
     let (producer, ctx) = default_broker();
-    producer.publish("clone-test", encode_u64(0)).unwrap();
+    producer.publish("clone-test", &0u64).unwrap();
 
     let ctx2 = ctx.clone();
     let mut a = ctx.create_client();
@@ -144,17 +135,11 @@ fn cloned_context_creates_independent_clients() {
     a.subscribe("clone-test").unwrap();
     b.subscribe("clone-test").unwrap();
 
-    producer.publish("clone-test", encode_u64(1)).unwrap();
-    producer.publish("clone-test", encode_u64(2)).unwrap();
+    producer.publish("clone-test", &1u64).unwrap();
+    producer.publish("clone-test", &2u64).unwrap();
 
-    let a_values: Vec<u64> = drain_u64(&mut a)
-        .into_iter()
-        .map(|(_, value)| value)
-        .collect();
-    let b_values: Vec<u64> = drain_u64(&mut b)
-        .into_iter()
-        .map(|(_, value)| value)
-        .collect();
+    let a_values: Vec<u64> = drain(&mut a).into_iter().map(|(_, v)| v).collect();
+    let b_values: Vec<u64> = drain(&mut b).into_iter().map(|(_, v)| v).collect();
 
     assert_eq!(a_values, vec![1, 2]);
     assert_eq!(b_values, vec![1, 2]);
@@ -163,25 +148,25 @@ fn cloned_context_creates_independent_clients() {
 #[test]
 fn dynamic_subscribe_unsubscribe_works() {
     let (producer, ctx) = default_broker();
-    producer.publish("a", b"a-prime").unwrap();
-    producer.publish("b", b"b-prime").unwrap();
+    producer.publish("a", &0u64).unwrap();
+    producer.publish("b", &0u64).unwrap();
 
     let mut client = ctx.create_client();
     client.subscribe("a").unwrap();
 
-    producer.publish("a", b"a1").unwrap();
-    producer.publish("b", b"b1").unwrap();
-    producer.publish("a", b"a2").unwrap();
+    producer.publish("a", &1u64).unwrap();
+    producer.publish("b", &10u64).unwrap();
+    producer.publish("a", &2u64).unwrap();
 
     let phase1 = drain(&mut client);
-    let phase1_payloads: Vec<Vec<u8>> = phase1.iter().map(|(_, payload)| payload.clone()).collect();
-    assert_eq!(phase1_payloads, vec![b"a1".to_vec(), b"a2".to_vec()]);
+    let phase1_values: Vec<u64> = phase1.iter().map(|(_, v)| *v).collect();
+    assert_eq!(phase1_values, vec![1, 2]);
 
     let id_a = phase1[0].0;
     client.subscribe("b").unwrap();
 
-    producer.publish("a", b"a3").unwrap();
-    producer.publish("b", b"b2").unwrap();
+    producer.publish("a", &3u64).unwrap();
+    producer.publish("b", &20u64).unwrap();
     let phase2 = drain(&mut client);
     assert!(phase2.iter().any(|(topic, _)| *topic == id_a));
     let id_b = phase2
@@ -191,12 +176,12 @@ fn dynamic_subscribe_unsubscribe_works() {
         .unwrap();
 
     client.unsubscribe(id_a);
-    producer.publish("a", b"a4").unwrap();
-    producer.publish("b", b"b3").unwrap();
+    producer.publish("a", &4u64).unwrap();
+    producer.publish("b", &30u64).unwrap();
 
     let phase3 = drain(&mut client);
     assert!(phase3.iter().all(|(topic, _)| *topic == id_b));
-    assert_eq!(phase3[0].1, b"b3");
+    assert_eq!(phase3[0].1, 30u64);
 }
 
 #[test]
@@ -208,66 +193,56 @@ fn unsubscribe_by_name_unknown_topic_is_noop() {
 
 #[test]
 fn overflow_drop_oldest_skips_to_oldest_available() {
-    let (producer, ctx) = small_broker(4, 8, OverflowPolicy::DropOldest);
-    producer.publish("lag", encode_u64(0)).unwrap();
+    let (producer, ctx) = small_broker(4, OverflowPolicy::DropOldest);
+    producer.publish("lag", &0u64).unwrap();
 
     let mut client = ctx.create_client();
     client.subscribe("lag").unwrap();
 
-    for value in 1..=8 {
-        producer.publish("lag", encode_u64(value)).unwrap();
+    for value in 1u64..=8 {
+        producer.publish("lag", &value).unwrap();
     }
 
     let message = client.poll().unwrap();
-    assert!(decode_u64(message.payload) >= 5);
+    assert!(*message.message >= 5u64);
 }
 
 #[test]
 fn overflow_skip_to_latest_receives_only_future_messages() {
-    let (producer, ctx) = small_broker(4, 8, OverflowPolicy::SkipToLatest);
-    producer.publish("skip", encode_u64(0)).unwrap();
+    let (producer, ctx) = small_broker(4, OverflowPolicy::SkipToLatest);
+    producer.publish("skip", &0u64).unwrap();
 
     let mut client = ctx.create_client();
     client.subscribe("skip").unwrap();
 
-    for value in 1..=8 {
-        producer.publish("skip", encode_u64(value)).unwrap();
+    for value in 1u64..=8 {
+        producer.publish("skip", &value).unwrap();
     }
 
     assert!(client.poll().is_none());
 
-    producer.publish("skip", encode_u64(99)).unwrap();
-    producer.publish("skip", encode_u64(100)).unwrap();
+    producer.publish("skip", &99u64).unwrap();
+    producer.publish("skip", &100u64).unwrap();
 
-    let values: Vec<u64> = drain_u64(&mut client)
-        .into_iter()
-        .map(|(_, value)| value)
-        .collect();
+    let values: Vec<u64> = drain(&mut client).into_iter().map(|(_, v)| v).collect();
     assert_eq!(values, vec![99, 100]);
 }
 
 #[test]
 fn overflow_drop_newest_leaves_consumer_stuck() {
-    let (producer, ctx) = small_broker(4, 8, OverflowPolicy::DropNewest);
-    producer.publish("drop", encode_u64(0)).unwrap();
+    let (producer, ctx) = small_broker(4, OverflowPolicy::DropNewest);
+    producer.publish("drop", &0u64).unwrap();
 
     let mut client = ctx.create_client();
     client.subscribe("drop").unwrap();
 
-    for value in 1..=8 {
-        producer.publish("drop", encode_u64(value)).unwrap();
+    for value in 1u64..=8 {
+        producer.publish("drop", &value).unwrap();
     }
 
     for _ in 0..5 {
         assert!(client.poll().is_none());
     }
-}
-
-#[test]
-fn payload_too_large_returns_error() {
-    let (producer, _ctx) = small_broker(4, 4, OverflowPolicy::DropOldest);
-    let err = producer.publish("topic", b"hello").unwrap_err();
-    assert_eq!(err, BctowError::PayloadTooLarge { size: 5, max: 4 });
 }
 
 #[test]
@@ -284,7 +259,7 @@ fn foreign_topic_ids_are_rejected() {
     let topic_id = producer_a.register_topic("shared");
 
     let (producer_b, ctx_b) = default_broker();
-    let err = producer_b.publish_id(topic_id, b"payload").unwrap_err();
+    let err = producer_b.publish_id(topic_id, &42u64).unwrap_err();
     assert_eq!(err, BctowError::TopicBrokerMismatch(topic_id));
 
     let mut client = ctx_b.create_client();
@@ -302,40 +277,33 @@ fn poll_with_no_subscriptions_returns_none() {
 #[test]
 fn subscribe_twice_does_not_duplicate_messages() {
     let (producer, ctx) = default_broker();
-    producer.publish("idem", encode_u64(0)).unwrap();
+    producer.publish("idem", &0u64).unwrap();
 
     let mut client = ctx.create_client();
     client.subscribe("idem").unwrap();
     client.subscribe("idem").unwrap();
 
-    producer.publish("idem", encode_u64(1)).unwrap();
-    producer.publish("idem", encode_u64(2)).unwrap();
+    producer.publish("idem", &1u64).unwrap();
+    producer.publish("idem", &2u64).unwrap();
 
-    let values: Vec<u64> = drain_u64(&mut client)
-        .into_iter()
-        .map(|(_, value)| value)
-        .collect();
+    let values: Vec<u64> = drain(&mut client).into_iter().map(|(_, v)| v).collect();
     assert_eq!(values, vec![1, 2]);
 }
 
 #[test]
-fn poll_into_reports_small_buffers() {
-    let (producer, ctx) = small_broker(4, 8, OverflowPolicy::DropOldest);
-    producer.publish("topic", b"prime").unwrap();
+fn poll_into_uses_caller_buffer() {
+    let (producer, ctx) = small_broker(4, OverflowPolicy::DropOldest);
+    producer.publish("topic", &0u64).unwrap();
 
     let mut client = ctx.create_client();
     client.subscribe("topic").unwrap();
-    producer.publish("topic", b"payload").unwrap();
+    producer.publish("topic", &42u64).unwrap();
 
-    let mut dst = [0u8; 4];
-    let err = client.poll_into(&mut dst).unwrap_err();
-    assert_eq!(
-        err,
-        BctowError::ReceiveBufferTooSmall {
-            required: 7,
-            available: 4
-        }
-    );
+    let mut dst = MaybeUninit::<u64>::uninit();
+    let topic_id = client.poll_into(&mut dst).unwrap();
+    assert_eq!(unsafe { dst.assume_init() }, 42u64);
+    // topic_id should be valid
+    let _ = topic_id;
 }
 
 #[cfg(feature = "metrics")]
@@ -345,13 +313,13 @@ mod metrics_tests {
     #[test]
     fn metrics_track_published_and_delivered_messages() {
         let (producer, ctx) = default_broker();
-        producer.publish("metrics", b"prime").unwrap();
+        producer.publish("metrics", &0u64).unwrap();
 
         let mut client = ctx.create_client();
         client.subscribe("metrics").unwrap();
 
-        producer.publish("metrics", b"a").unwrap();
-        producer.publish("metrics", b"b").unwrap();
+        producer.publish("metrics", &1u64).unwrap();
+        producer.publish("metrics", &2u64).unwrap();
         let delivered = drain(&mut client);
 
         let metrics = ctx.metrics();
@@ -364,8 +332,8 @@ mod metrics_tests {
 fn multithreaded_producer_and_consumers_no_panics() {
     const MSG_COUNT: u64 = 200;
 
-    let (producer, ctx) = small_broker(512, 8, OverflowPolicy::DropOldest);
-    producer.publish("shared", encode_u64(0)).unwrap();
+    let (producer, ctx) = small_broker(512, OverflowPolicy::DropOldest);
+    producer.publish("shared", &0u64).unwrap();
 
     let clients: Vec<_> = (0..4)
         .map(|_| {
@@ -376,18 +344,15 @@ fn multithreaded_producer_and_consumers_no_panics() {
         .collect();
 
     let producer_handle = thread::spawn(move || {
-        for value in 1..=MSG_COUNT {
-            producer.publish("shared", encode_u64(value)).unwrap();
+        for value in 1u64..=MSG_COUNT {
+            producer.publish("shared", &value).unwrap();
         }
     });
 
     producer_handle.join().unwrap();
 
     for mut client in clients {
-        let values: Vec<u64> = drain_u64(&mut client)
-            .into_iter()
-            .map(|(_, value)| value)
-            .collect();
+        let values: Vec<u64> = drain(&mut client).into_iter().map(|(_, v)| v).collect();
         assert!(!values.is_empty());
         assert!(values.windows(2).all(|pair| pair[0] < pair[1]));
     }
@@ -397,8 +362,8 @@ fn multithreaded_producer_and_consumers_no_panics() {
 fn multithreaded_truly_concurrent_producer_and_consumers() {
     const MSG_COUNT: u64 = 500;
 
-    let (producer, ctx) = small_broker(1024, 8, OverflowPolicy::DropOldest);
-    producer.publish("concurrent", encode_u64(0)).unwrap();
+    let (producer, ctx) = small_broker(1024, OverflowPolicy::DropOldest);
+    producer.publish("concurrent", &0u64).unwrap();
 
     let clients: Vec<_> = (0..4)
         .map(|_| {
@@ -417,7 +382,7 @@ fn multithreaded_truly_concurrent_producer_and_consumers() {
 
                 while received.len() < MSG_COUNT as usize && attempts < 100_000 {
                     if let Some(message) = client.poll() {
-                        received.push(decode_u64(message.payload));
+                        received.push(*message.message);
                     } else {
                         attempts += 1;
                         thread::yield_now();
@@ -430,8 +395,8 @@ fn multithreaded_truly_concurrent_producer_and_consumers() {
         .collect();
 
     let producer_handle = thread::spawn(move || {
-        for value in 1..=MSG_COUNT {
-            producer.publish("concurrent", encode_u64(value)).unwrap();
+        for value in 1u64..=MSG_COUNT {
+            producer.publish("concurrent", &value).unwrap();
         }
     });
 
@@ -442,4 +407,78 @@ fn multithreaded_truly_concurrent_producer_and_consumers() {
         assert!(!values.is_empty());
         assert!(values.windows(2).all(|pair| pair[0] < pair[1]));
     }
+}
+
+#[test]
+fn custom_copy_struct_publish_and_receive() {
+    let (producer, ctx) = broker::<SensorReading>(BctowConfig::default());
+
+    let seed = SensorReading {
+        sensor_id: 0,
+        value: 0.0,
+        timestamp: 0,
+    };
+    producer.publish("sensors", &seed).unwrap();
+
+    let mut client = ctx.create_client();
+    client.subscribe("sensors").unwrap();
+
+    let readings = [
+        SensorReading { sensor_id: 1, value: 23.5, timestamp: 1000 },
+        SensorReading { sensor_id: 2, value: -7.1, timestamp: 2000 },
+        SensorReading { sensor_id: 1, value: 24.0, timestamp: 3000 },
+    ];
+
+    for r in &readings {
+        producer.publish("sensors", r).unwrap();
+    }
+
+    let received: Vec<SensorReading> = {
+        let mut out = Vec::new();
+        while let Some(msg) = client.poll() {
+            out.push(*msg.message);
+        }
+        out
+    };
+
+    assert_eq!(received, readings);
+}
+
+#[test]
+fn fixed_bytes_roundtrip_through_broker() {
+    const N: usize = 64;
+    let messages: &[&[u8]] = &[b"hello", b"world", b"", b"exactly 64 bytes?", b"\x00\xFF\xAB"];
+
+    let (producer, ctx) = broker::<FixedBytes<N>>(BctowConfig::default());
+
+    // Publish a sentinel before the consumer subscribes to anchor the cursor.
+    producer
+        .publish("bytes", &FixedBytes::<N>::new(b"sentinel").unwrap())
+        .unwrap();
+
+    let mut client = ctx.create_client();
+    client.subscribe("bytes").unwrap();
+
+    for msg in messages {
+        producer
+            .publish("bytes", &FixedBytes::<N>::new(msg).unwrap())
+            .unwrap();
+    }
+
+    let received: Vec<Vec<u8>> = {
+        let mut out = Vec::new();
+        while let Some(msg) = client.poll() {
+            out.push(msg.message.as_bytes().to_vec());
+        }
+        out
+    };
+
+    let expected: Vec<Vec<u8>> = messages.iter().map(|p| p.to_vec()).collect();
+    assert_eq!(received, expected);
+}
+
+#[test]
+fn fixed_bytes_too_large_error() {
+    let err = FixedBytes::<4>::new(b"hello").unwrap_err();
+    assert_eq!(err, BctowError::MessageTooLarge { size: 5, max: 4 });
 }

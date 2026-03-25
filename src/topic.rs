@@ -91,13 +91,13 @@ pub struct TopicPattern {
     _private: (),
 }
 
-pub(crate) struct TopicEntry {
+pub(crate) struct TopicEntry<T> {
     id: TopicId,
     name: String,
-    ring: Arc<RingBuffer>,
+    ring: Arc<RingBuffer<T>>,
 }
 
-impl TopicEntry {
+impl<T> TopicEntry<T> {
     pub(crate) fn id(&self) -> TopicId {
         self.id
     }
@@ -106,30 +106,28 @@ impl TopicEntry {
         &self.name
     }
 
-    pub(crate) fn ring(&self) -> &Arc<RingBuffer> {
+    pub(crate) fn ring(&self) -> &Arc<RingBuffer<T>> {
         &self.ring
     }
 }
 
-struct RegistryInner {
+struct RegistryInner<T> {
     by_name: HashMap<String, TopicId>,
-    topics: Vec<Arc<TopicEntry>>,
+    topics: Vec<Arc<TopicEntry<T>>>,
 }
 
 /// Thread-safe mapping between topic strings, topic ids, and per-topic rings.
-pub(crate) struct TopicRegistry {
+pub(crate) struct TopicRegistry<T> {
     broker_id: u64,
     ring_buffer_capacity: usize,
-    max_payload_size: usize,
-    inner: RwLock<RegistryInner>,
+    inner: RwLock<RegistryInner<T>>,
 }
 
-impl TopicRegistry {
-    pub(crate) fn new(ring_buffer_capacity: usize, max_payload_size: usize) -> Self {
+impl<T: Copy + Send + Sync + 'static> TopicRegistry<T> {
+    pub(crate) fn new(ring_buffer_capacity: usize) -> Self {
         Self {
             broker_id: NEXT_BROKER_ID.fetch_add(1, Ordering::Relaxed),
             ring_buffer_capacity,
-            max_payload_size,
             inner: RwLock::new(RegistryInner {
                 by_name: HashMap::new(),
                 topics: Vec::new(),
@@ -141,7 +139,7 @@ impl TopicRegistry {
         self.broker_id
     }
 
-    pub(crate) fn get_or_create(&self, key: &str) -> Arc<TopicEntry> {
+    pub(crate) fn get_or_create(&self, key: &str) -> Arc<TopicEntry<T>> {
         {
             let guard = self
                 .inner
@@ -184,17 +182,14 @@ impl TopicRegistry {
         let entry = Arc::new(TopicEntry {
             id,
             name: key.to_owned(),
-            ring: Arc::new(RingBuffer::new(
-                self.ring_buffer_capacity,
-                self.max_payload_size,
-            )),
+            ring: Arc::new(RingBuffer::new(self.ring_buffer_capacity)),
         });
         guard.by_name.insert(entry.name.clone(), id);
         guard.topics.push(Arc::clone(&entry));
         entry
     }
 
-    pub(crate) fn resolve(&self, key: &str) -> Option<Arc<TopicEntry>> {
+    pub(crate) fn resolve(&self, key: &str) -> Option<Arc<TopicEntry<T>>> {
         let guard = self
             .inner
             .read()
@@ -203,7 +198,7 @@ impl TopicRegistry {
         guard.topics.get(id.index as usize).map(Arc::clone)
     }
 
-    pub(crate) fn get(&self, id: TopicId) -> Option<Arc<TopicEntry>> {
+    pub(crate) fn get(&self, id: TopicId) -> Option<Arc<TopicEntry<T>>> {
         if id.broker != self.broker_id {
             return None;
         }
@@ -227,8 +222,8 @@ mod tests {
 
     #[test]
     fn topic_id_carries_broker_identity() {
-        let a = TopicRegistry::new(4, 32);
-        let b = TopicRegistry::new(4, 32);
+        let a = TopicRegistry::<u64>::new(4);
+        let b = TopicRegistry::<u64>::new(4);
 
         let a_id = a.get_or_create("topic").id();
         let b_id = b.get_or_create("topic").id();
@@ -247,7 +242,7 @@ mod tests {
 
     #[test]
     fn registry_resolves_existing_topics_without_duplication() {
-        let registry = TopicRegistry::new(8, 64);
+        let registry = TopicRegistry::<u64>::new(8);
 
         let first = registry.get_or_create("alpha");
         let second = registry.get_or_create("alpha");
@@ -261,8 +256,8 @@ mod tests {
 
     #[test]
     fn registry_rejects_foreign_topic_ids() {
-        let a = TopicRegistry::new(4, 32);
-        let b = TopicRegistry::new(4, 32);
+        let a = TopicRegistry::<u64>::new(4);
+        let b = TopicRegistry::<u64>::new(4);
 
         let a_id = a.get_or_create("topic").id();
         assert!(b.get(a_id).is_none());
@@ -271,7 +266,7 @@ mod tests {
 
     #[test]
     fn concurrent_get_or_create_returns_same_id() {
-        let registry = Arc::new(TopicRegistry::new(4, 32));
+        let registry = Arc::new(TopicRegistry::<u64>::new(4));
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let registry = Arc::clone(&registry);
