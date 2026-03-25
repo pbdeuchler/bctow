@@ -35,6 +35,7 @@
 pub mod config;
 pub mod consumer;
 pub mod error;
+pub mod fixed_bytes;
 pub mod producer;
 pub mod topic;
 
@@ -49,6 +50,7 @@ use broker::BrokerInner;
 pub use config::{BctowConfig, OverflowPolicy};
 pub use consumer::{ConsumerClient, ConsumerContext, ReceivedMessage};
 pub use error::BctowError;
+pub use fixed_bytes::FixedBytes;
 pub use producer::Producer;
 pub use topic::{ExactTopic, TopicId, TopicKey};
 

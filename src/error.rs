@@ -10,6 +10,8 @@ pub enum BctowError {
     TopicNotFound(String),
     /// The supplied topic id belongs to a different broker instance.
     TopicBrokerMismatch(TopicId),
+    /// The message exceeds the fixed-size buffer capacity.
+    MessageTooLarge { size: usize, max: usize },
 }
 
 impl fmt::Display for BctowError {
@@ -18,6 +20,9 @@ impl fmt::Display for BctowError {
             BctowError::TopicNotFound(desc) => write!(f, "topic not found: {desc}"),
             BctowError::TopicBrokerMismatch(topic) => {
                 write!(f, "topic belongs to a different broker: {topic}")
+            }
+            BctowError::MessageTooLarge { size, max } => {
+                write!(f, "message too large: size {size} exceeds capacity {max}")
             }
         }
     }
