@@ -25,6 +25,7 @@ bctow: generic typed pub/sub ring buffer library (Rust)
 - poll_into no longer returns Result — just Option<TopicId>
 - ReceivedMessage.payload (&[u8]) replaced by .message (&T)
 - RingBuffer.max_payload_size() removed
+- All "payload"/"byte" language in docs/comments replaced with "value"/"message" terminology (step 02)
 
 ## OverflowPolicy
 - DropOldest (default): skip to oldest_available_seq on lag
