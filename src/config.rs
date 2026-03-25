@@ -11,8 +11,6 @@ pub enum OverflowPolicy {
 
 #[derive(Debug, Clone)]
 pub struct BctowConfig {
-    /// Maximum message payload size in bytes.
-    pub max_payload_size: usize,
     /// Number of slots in the per-topic ring buffer.
     pub ring_buffer_capacity: usize,
     /// Policy applied when a consumer falls behind retention.
@@ -22,7 +20,6 @@ pub struct BctowConfig {
 impl Default for BctowConfig {
     fn default() -> Self {
         Self {
-            max_payload_size: 16_384,
             ring_buffer_capacity: 1_024,
             overflow_policy: OverflowPolicy::default(),
         }

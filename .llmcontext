@@ -1,0 +1,47 @@
+bctow: generic typed pub/sub ring buffer library (Rust)
+
+## Architecture
+- Single-producer, multi-consumer broker with per-topic ring buffers
+- Generic over T: Copy+Send+Sync+'static — values stored inline in MaybeUninit<T> slots
+- Type chain: RingBuffer<T> → TopicEntry<T> → RegistryInner<T> → TopicRegistry<T> → BrokerInner<T> → Producer<T>/ConsumerContext<T>/ConsumerClient<T>
+- Entry point: `broker::<T>(BctowConfig) -> (Producer<T>, ConsumerContext<T>)`
+
+## Key types
+- Producer<T>: publish(&T)/publish_id(TopicId, &T), register_topic() — Send not Sync, cached ring refs avoid lock on hot path
+- ConsumerContext<T>: Clone, create_client() → ConsumerClient<T>
+- ConsumerClient<T>: subscribe/unsubscribe, poll() → Option<ReceivedMessage<'_, T>>, poll_into(&mut MaybeUninit<T>) → Option<TopicId>
+- ReceivedMessage<'a, T>: {topic_id: TopicId, message: &'a T}
+- TopicId: broker-branded (broker_id + index), not generic
+- BctowConfig: {ring_buffer_capacity: usize, overflow_policy: OverflowPolicy} — NO max_payload_size
+
+## Ring protocol
+- Slot<T>: version(AtomicU64 even=stable/odd=writer), readers(AtomicUsize), sequence(AtomicU64), data(UnsafeCell<MaybeUninit<T>>)
+- push: fetch_add version (odd), spin on readers==0, copy_nonoverlapping, store seq, fetch_add version (even)
+- read_into: check version even, check seq match, inc readers, re-check version+seq, copy_nonoverlapping, dec readers → Option<()>
+
+## Removed from original byte-oriented API
+- BctowConfig.max_payload_size removed
+- BctowError::PayloadTooLarge and ::ReceiveBufferTooSmall removed
+- poll_into no longer returns Result — just Option<TopicId>
+- ReceivedMessage.payload (&[u8]) replaced by .message (&T)
+- RingBuffer.max_payload_size() removed
+
+## OverflowPolicy
+- DropOldest (default): skip to oldest_available_seq on lag
+- DropNewest: stay stuck at current cursor
+- SkipToLatest: jump to latest+1 on lag
+
+## Features
+- metrics: adds AtomicU64 counters on BrokerInner, exposes Metrics via ConsumerContext::metrics()
+
+## Files
+- src/ring.rs: Slot<T>, RingBuffer<T>, Cursor
+- src/topic.rs: TopicId, TopicKey trait, ExactTopic, TopicEntry<T>, TopicRegistry<T>
+- src/broker.rs: BrokerInner<T>
+- src/config.rs: BctowConfig, OverflowPolicy
+- src/error.rs: BctowError (2 variants only)
+- src/producer.rs: Producer<T>
+- src/consumer.rs: ConsumerContext<T>, ConsumerClient<T>, ReceivedMessage<'a,T>, try_read_with_policy
+- src/lib.rs: pub broker<T>() fn, re-exports
+- tests/integration.rs: all tests use u64 as message type
+- examples/basic.rs: broker::<u64> demo

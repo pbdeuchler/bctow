@@ -1,67 +1,60 @@
 use std::cell::UnsafeCell;
 use std::hint::spin_loop;
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::error::BctowError;
-
-struct Slot {
+struct Slot<T> {
     /// Even = stable snapshot, odd = writer owns the slot.
     version: AtomicU64,
-    /// Number of readers currently copying bytes out of this slot.
+    /// Number of readers currently copying data out of this slot.
     readers: AtomicUsize,
     /// Sequence number currently stored in the slot. `0` means empty.
     sequence: AtomicU64,
-    len: AtomicUsize,
-    bytes: UnsafeCell<Box<[u8]>>,
+    data: UnsafeCell<MaybeUninit<T>>,
 }
 
-impl Slot {
-    fn new(max_payload_size: usize) -> Self {
+impl<T> Slot<T> {
+    fn new() -> Self {
         Self {
             version: AtomicU64::new(0),
             readers: AtomicUsize::new(0),
             sequence: AtomicU64::new(0),
-            len: AtomicUsize::new(0),
-            bytes: UnsafeCell::new(vec![0; max_payload_size].into_boxed_slice()),
+            data: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
 }
 
 // SAFETY: Slot access is coordinated by the per-slot version/readers protocol.
-unsafe impl Send for Slot {}
-unsafe impl Sync for Slot {}
+unsafe impl<T: Send> Send for Slot<T> {}
+unsafe impl<T: Sync> Sync for Slot<T> {}
 
-/// Single-producer, multiple-consumer ring buffer for fixed-size byte payloads.
-pub(crate) struct RingBuffer {
-    slots: Box<[Slot]>,
+/// Single-producer, multiple-consumer ring buffer for typed payloads.
+pub(crate) struct RingBuffer<T> {
+    slots: Box<[Slot<T>]>,
     capacity: usize,
-    max_payload_size: usize,
     /// Next sequence number to hand out. Starts at 1.
     write_seq: AtomicU64,
 }
 
 // SAFETY: The ring enforces single-writer access at the API boundary and uses
 // atomics to coordinate concurrent readers.
-unsafe impl Send for RingBuffer {}
-unsafe impl Sync for RingBuffer {}
+unsafe impl<T: Send> Send for RingBuffer<T> {}
+unsafe impl<T: Sync> Sync for RingBuffer<T> {}
 
-impl RingBuffer {
-    pub(crate) fn new(capacity: usize, max_payload_size: usize) -> Self {
+impl<T: Copy> RingBuffer<T> {
+    pub(crate) fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "ring buffer capacity must be > 0");
 
-        let slots: Box<[Slot]> = (0..capacity).map(|_| Slot::new(max_payload_size)).collect();
+        let slots: Box<[Slot<T>]> = (0..capacity).map(|_| Slot::new()).collect();
 
         Self {
             slots,
             capacity,
-            max_payload_size,
             write_seq: AtomicU64::new(1),
         }
     }
 
-    pub(crate) fn push(&self, payload: &[u8]) -> u64 {
-        debug_assert!(payload.len() <= self.max_payload_size);
-
+    pub(crate) fn push(&self, value: &T) -> u64 {
         let seq = self
             .write_seq
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
@@ -80,19 +73,18 @@ impl RingBuffer {
         }
 
         unsafe {
-            let bytes = &mut *slot.bytes.get();
-            bytes[..payload.len()].copy_from_slice(payload);
+            let dst = &mut *slot.data.get();
+            std::ptr::copy_nonoverlapping(value as *const T, dst.as_mut_ptr(), 1);
         }
-        slot.len.store(payload.len(), Ordering::Relaxed);
         slot.sequence.store(seq, Ordering::Release);
         slot.version.fetch_add(1, Ordering::Release);
 
         seq
     }
 
-    pub(crate) fn read_into(&self, seq: u64, dst: &mut [u8]) -> Result<Option<usize>, BctowError> {
+    pub(crate) fn read_into(&self, seq: u64, dst: &mut MaybeUninit<T>) -> Option<()> {
         if seq == 0 {
-            return Ok(None);
+            return None;
         }
 
         let idx = ((seq - 1) as usize) % self.capacity;
@@ -100,12 +92,12 @@ impl RingBuffer {
 
         let version_before = slot.version.load(Ordering::Acquire);
         if version_before % 2 == 1 {
-            return Ok(None);
+            return None;
         }
 
         let stored_seq = slot.sequence.load(Ordering::Acquire);
         if stored_seq != seq {
-            return Ok(None);
+            return None;
         }
 
         slot.readers.fetch_add(1, Ordering::Acquire);
@@ -114,25 +106,16 @@ impl RingBuffer {
         let stored_after = slot.sequence.load(Ordering::Acquire);
         if version_before != version_after || version_after % 2 == 1 || stored_after != seq {
             slot.readers.fetch_sub(1, Ordering::Release);
-            return Ok(None);
-        }
-
-        let len = slot.len.load(Ordering::Acquire);
-        if dst.len() < len {
-            slot.readers.fetch_sub(1, Ordering::Release);
-            return Err(BctowError::ReceiveBufferTooSmall {
-                required: len,
-                available: dst.len(),
-            });
+            return None;
         }
 
         unsafe {
-            let bytes = &*slot.bytes.get();
-            dst[..len].copy_from_slice(&bytes[..len]);
+            let src = &*slot.data.get();
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr(), 1);
         }
 
         slot.readers.fetch_sub(1, Ordering::Release);
-        Ok(Some(len))
+        Some(())
     }
 
     pub(crate) fn latest_seq(&self) -> u64 {
@@ -150,11 +133,6 @@ impl RingBuffer {
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
-
-    #[allow(dead_code)]
-    pub(crate) fn max_payload_size(&self) -> usize {
-        self.max_payload_size
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -168,7 +146,7 @@ impl Cursor {
         Self { next_seq: 1 }
     }
 
-    pub(crate) fn new_latest(ring: &RingBuffer) -> Self {
+    pub(crate) fn new_latest<T: Copy>(ring: &RingBuffer<T>) -> Self {
         Self {
             next_seq: ring.latest_seq() + 1,
         }
@@ -196,79 +174,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_back_written_payload() {
-        let ring = RingBuffer::new(4, 32);
-        let seq = ring.push(b"hello");
-        let mut dst = [0u8; 32];
-        let len = ring.read_into(seq, &mut dst).unwrap().unwrap();
-        assert_eq!(&dst[..len], b"hello");
+    fn read_back_written_value() {
+        let ring = RingBuffer::<u64>::new(4);
+        let seq = ring.push(&42u64);
+        let mut dst = MaybeUninit::<u64>::uninit();
+        ring.read_into(seq, &mut dst).unwrap();
+        assert_eq!(unsafe { dst.assume_init() }, 42u64);
     }
 
     #[test]
     fn read_overwritten_payload_returns_none() {
-        let ring = RingBuffer::new(2, 32);
-        ring.push(b"one");
-        ring.push(b"two");
-        ring.push(b"three");
+        let ring = RingBuffer::<u64>::new(2);
+        ring.push(&1u64);
+        ring.push(&2u64);
+        ring.push(&3u64);
 
-        let mut dst = [0u8; 32];
-        assert!(ring.read_into(1, &mut dst).unwrap().is_none());
-    }
-
-    #[test]
-    fn read_into_rejects_small_buffers() {
-        let ring = RingBuffer::new(2, 32);
-        let seq = ring.push(b"hello");
-        let mut dst = [0u8; 4];
-        let err = ring.read_into(seq, &mut dst).unwrap_err();
-        assert_eq!(
-            err,
-            BctowError::ReceiveBufferTooSmall {
-                required: 5,
-                available: 4
-            }
-        );
+        let mut dst = MaybeUninit::<u64>::uninit();
+        assert!(ring.read_into(1, &mut dst).is_none());
     }
 
     #[test]
     fn retained_reader_blocks_writer_until_copy_finishes() {
-        let ring = Arc::new(RingBuffer::new(1, 32));
-        let seq = ring.push(b"hello");
+        let ring = Arc::new(RingBuffer::<u64>::new(1));
+        let seq = ring.push(&100u64);
 
         let reader_ring = Arc::clone(&ring);
         let reader = thread::spawn(move || {
-            let mut dst = [0u8; 32];
-            let len = reader_ring.read_into(seq, &mut dst).unwrap().unwrap();
-            assert_eq!(&dst[..len], b"hello");
+            let mut dst = MaybeUninit::<u64>::uninit();
+            reader_ring.read_into(seq, &mut dst).unwrap();
+            assert_eq!(unsafe { dst.assume_init() }, 100u64);
         });
 
         reader.join().unwrap();
 
-        let seq2 = ring.push(b"world");
-        let mut dst = [0u8; 32];
-        let len = ring.read_into(seq2, &mut dst).unwrap().unwrap();
-        assert_eq!(&dst[..len], b"world");
+        let seq2 = ring.push(&200u64);
+        let mut dst = MaybeUninit::<u64>::uninit();
+        ring.read_into(seq2, &mut dst).unwrap();
+        assert_eq!(unsafe { dst.assume_init() }, 200u64);
     }
 
     #[test]
-    fn concurrent_readers_copy_bytes_safely() {
-        let ring = Arc::new(RingBuffer::new(64, 64));
-        let seqs: Vec<_> = (0..16)
-            .map(|n| {
-                let payload = format!("msg-{n}");
-                ring.push(payload.as_bytes())
-            })
-            .collect();
+    fn concurrent_readers_copy_values_safely() {
+        let ring = Arc::new(RingBuffer::<u64>::new(64));
+        let seqs: Vec<_> = (0u64..16).map(|n| ring.push(&n)).collect();
 
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let ring = Arc::clone(&ring);
                 let seqs = seqs.clone();
                 thread::spawn(move || {
-                    for seq in &seqs {
-                        let mut dst = [0u8; 64];
-                        let len = ring.read_into(*seq, &mut dst).unwrap().unwrap();
-                        assert!(dst[..len].starts_with(b"msg-"));
+                    for (i, seq) in seqs.iter().enumerate() {
+                        let mut dst = MaybeUninit::<u64>::uninit();
+                        ring.read_into(*seq, &mut dst).unwrap();
+                        assert_eq!(unsafe { dst.assume_init() }, i as u64);
                     }
                 })
             })
@@ -283,13 +241,12 @@ mod tests {
     fn concurrent_producer_and_consumers_make_progress() {
         const MSG_COUNT: u64 = 1_000;
 
-        let ring = Arc::new(RingBuffer::new(128, 32));
+        let ring = Arc::new(RingBuffer::<u64>::new(128));
 
         let producer_ring = Arc::clone(&ring);
         let producer = thread::spawn(move || {
             for n in 1..=MSG_COUNT {
-                let bytes = n.to_le_bytes();
-                producer_ring.push(&bytes);
+                producer_ring.push(&n);
             }
         });
 
@@ -299,13 +256,12 @@ mod tests {
                 thread::spawn(move || {
                     let mut seq = 1;
                     let mut reads = 0u64;
-                    let mut dst = [0u8; 8];
+                    let mut dst = MaybeUninit::<u64>::uninit();
 
                     while seq <= MSG_COUNT {
-                        match ring.read_into(seq, &mut dst).unwrap() {
-                            Some(len) => {
-                                assert_eq!(len, 8);
-                                assert_eq!(u64::from_le_bytes(dst), seq);
+                        match ring.read_into(seq, &mut dst) {
+                            Some(()) => {
+                                assert_eq!(unsafe { dst.assume_init() }, seq);
                                 seq += 1;
                                 reads += 1;
                             }

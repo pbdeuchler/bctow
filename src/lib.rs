@@ -1,7 +1,7 @@
 //! # bctow — high-throughput topic-based pub/sub
 //!
 //! bctow is a single-producer, many-consumer broker for in-process streaming
-//! systems. The broker stores byte payloads in preallocated per-topic rings and
+//! systems. The broker stores typed values in preallocated per-topic rings and
 //! copies them into consumer-owned buffers on read, so steady-state publish and
 //! receive paths avoid heap allocation.
 //!
@@ -10,16 +10,16 @@
 //! ```rust
 //! use bctow::{BctowConfig, broker};
 //!
-//! let (producer, ctx) = broker(BctowConfig::default());
+//! let (producer, ctx) = broker::<u64>(BctowConfig::default());
 //!
-//! producer.publish("events/sensor", b"temp=42").unwrap();
+//! producer.publish("events/sensor", &42u64).unwrap();
 //!
 //! let mut client = ctx.create_client();
 //! client.subscribe("events/sensor").unwrap();
 //!
-//! producer.publish("events/sensor", b"temp=43").unwrap();
+//! producer.publish("events/sensor", &43u64).unwrap();
 //! let msg = client.poll().unwrap();
-//! assert_eq!(msg.payload, b"temp=43");
+//! assert_eq!(*msg.message, 43u64);
 //! ```
 //!
 //! ## Architecture
@@ -27,7 +27,7 @@
 //! - One producer thread appends to a shared ring per topic.
 //! - Each consumer maintains its own cursor per subscribed topic.
 //! - Topic ids are broker-branded so cross-broker misuse fails fast.
-//! - Messages are copied into preallocated slot buffers on publish and into
+//! - Values are copied into preallocated typed slots on publish and into
 //!   caller-owned or client-owned buffers on receive.
 //! - `publish_id` uses a producer-local ring cache so steady-state publishing to
 //!   known topics avoids broker registry locks.
@@ -56,7 +56,9 @@ pub use topic::{ExactTopic, TopicId, TopicKey};
 pub use consumer::Metrics;
 
 /// Create a matched `Producer` + `ConsumerContext` pair sharing the same broker state.
-pub fn broker(config: BctowConfig) -> (Producer, ConsumerContext) {
+pub fn broker<T: Copy + Send + Sync + 'static>(
+    config: BctowConfig,
+) -> (Producer<T>, ConsumerContext<T>) {
     let overflow_policy = config.overflow_policy;
     let inner = Arc::new(BrokerInner::new(config));
     (
