@@ -65,3 +65,108 @@ impl<const N: usize> PartialEq for FixedBytes<N> {
 }
 
 impl<const N: usize> Eq for FixedBytes<N> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper type aliases to keep test cases concise.
+    type FB16 = FixedBytes<16>;
+    type FB5 = FixedBytes<5>;
+    type FB4 = FixedBytes<4>;
+    type FB32 = FixedBytes<32>;
+
+    // --- new / construction ---
+
+    #[test]
+    fn new_from_slice() {
+        let fb = FB16::new(b"hello").unwrap();
+        assert_eq!(fb.as_bytes(), b"hello");
+        assert_eq!(fb.len(), 5);
+        assert!(!fb.is_empty());
+    }
+
+    #[test]
+    fn new_empty_slice() {
+        let fb = FB16::new(b"").unwrap();
+        assert_eq!(fb.as_bytes(), b"");
+        assert_eq!(fb.len(), 0);
+        assert!(fb.is_empty());
+    }
+
+    #[test]
+    fn new_exact_capacity() {
+        let fb = FB5::new(b"hello").unwrap();
+        assert_eq!(fb.as_bytes(), b"hello");
+        assert_eq!(fb.len(), 5);
+    }
+
+    #[test]
+    fn new_too_large() {
+        let err = FB4::new(b"hello").unwrap_err();
+        assert_eq!(err, BctowError::MessageTooLarge { size: 5, max: 4 });
+    }
+
+    // --- capacity ---
+
+    #[test]
+    fn capacity_is_const_n() {
+        assert_eq!(FB32::capacity(), 32);
+        assert_eq!(FB16::capacity(), 16);
+        assert_eq!(FB4::capacity(), 4);
+    }
+
+    // --- PartialEq / Eq ---
+
+    #[test]
+    fn partial_eq_compares_content_not_padding() {
+        let a = FB16::new(b"hi").unwrap();
+        let b = FB16::new(b"hi").unwrap();
+        // Both are zero-initialised so padding is identical, but the key
+        // invariant is that equality depends only on the live bytes.
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn partial_eq_different_content() {
+        let a = FB16::new(b"hello").unwrap();
+        let b = FB16::new(b"world").unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn partial_eq_same_prefix_different_length_are_not_equal() {
+        let a = FB16::new(b"hello").unwrap();
+        let b = FB16::new(b"hell").unwrap();
+        assert_ne!(a, b);
+    }
+
+    // --- Debug ---
+
+    #[test]
+    fn debug_shows_content() {
+        let fb = FB16::new(b"abc").unwrap();
+        let s = format!("{fb:?}");
+        // The Debug impl prints as_bytes(), so the content must appear.
+        assert!(s.contains("97")); // b'a' == 97
+        assert!(s.contains("98")); // b'b' == 98
+        assert!(s.contains("99")); // b'c' == 99
+        assert!(s.contains("len"));
+    }
+
+    // --- Copy semantics ---
+
+    #[test]
+    fn copy_semantics() {
+        let original = FB16::new(b"copy me").unwrap();
+        let copy = original; // bitwise copy, not a move
+        // Both are independently readable — no borrow-checker error proves Copy.
+        assert_eq!(original.as_bytes(), b"copy me");
+        assert_eq!(copy.as_bytes(), b"copy me");
+        // They are equal in value ...
+        assert_eq!(original, copy);
+        // ... but modifying a new value derived from `copy` does not affect original.
+        let modified = FB16::new(b"changed").unwrap();
+        assert_ne!(original, modified);
+    }
+}

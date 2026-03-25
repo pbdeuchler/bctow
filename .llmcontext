@@ -19,6 +19,13 @@ bctow: generic typed pub/sub ring buffer library (Rust)
 - push: fetch_add version (odd), spin on readers==0, copy_nonoverlapping, store seq, fetch_add version (even)
 - read_into: check version even, check seq match, inc readers, re-check version+seq, copy_nonoverlapping, dec readers → Option<()>
 
+## FixedBytes<N>
+- Copy wrapper storing up to N bytes inline — satisfies T: Copy+Send+Sync for use as broker<FixedBytes<N>>
+- API: new(&[u8]) -> Result<Self, BctowError>, as_bytes()->&[u8], len()->usize, is_empty()->bool, capacity()->usize (const)
+- PartialEq compares only the live bytes (len), ignoring zero-padded tail
+- Returns BctowError::MessageTooLarge { size, max } when data.len() > N
+- src/fixed_bytes.rs
+
 ## Removed from original byte-oriented API
 - BctowConfig.max_payload_size removed
 - BctowError::PayloadTooLarge and ::ReceiveBufferTooSmall removed
@@ -40,9 +47,9 @@ bctow: generic typed pub/sub ring buffer library (Rust)
 - src/topic.rs: TopicId, TopicKey trait, ExactTopic, TopicEntry<T>, TopicRegistry<T>
 - src/broker.rs: BrokerInner<T>
 - src/config.rs: BctowConfig, OverflowPolicy
-- src/error.rs: BctowError (2 variants only)
+- src/error.rs: BctowError — TopicNotFound(String), TopicBrokerMismatch(TopicId), MessageTooLarge{size,max}
 - src/producer.rs: Producer<T>
 - src/consumer.rs: ConsumerContext<T>, ConsumerClient<T>, ReceivedMessage<'a,T>, try_read_with_policy
 - src/lib.rs: pub broker<T>() fn, re-exports
-- tests/integration.rs: all tests use u64 as message type
+- tests/integration.rs: most tests use u64; SensorReading (Copy struct) and FixedBytes<64> also covered
 - examples/basic.rs: broker::<u64> demo

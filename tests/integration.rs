@@ -2,8 +2,8 @@ use std::mem::MaybeUninit;
 use std::thread;
 
 use bctow::{
-    broker, BctowConfig, BctowError, ConsumerClient, ConsumerContext, ExactTopic, OverflowPolicy,
-    Producer, TopicId,
+    broker, BctowConfig, BctowError, ConsumerClient, ConsumerContext, ExactTopic, FixedBytes,
+    OverflowPolicy, Producer, TopicId,
 };
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -442,4 +442,43 @@ fn custom_copy_struct_publish_and_receive() {
     };
 
     assert_eq!(received, readings);
+}
+
+#[test]
+fn fixed_bytes_roundtrip_through_broker() {
+    const N: usize = 64;
+    let payloads: &[&[u8]] = &[b"hello", b"world", b"", b"exactly 64 bytes?", b"\x00\xFF\xAB"];
+
+    let (producer, ctx) = broker::<FixedBytes<N>>(BctowConfig::default());
+
+    // Publish a sentinel before the consumer subscribes to anchor the cursor.
+    producer
+        .publish("bytes", &FixedBytes::<N>::new(b"sentinel").unwrap())
+        .unwrap();
+
+    let mut client = ctx.create_client();
+    client.subscribe("bytes").unwrap();
+
+    for payload in payloads {
+        producer
+            .publish("bytes", &FixedBytes::<N>::new(payload).unwrap())
+            .unwrap();
+    }
+
+    let received: Vec<Vec<u8>> = {
+        let mut out = Vec::new();
+        while let Some(msg) = client.poll() {
+            out.push(msg.message.as_bytes().to_vec());
+        }
+        out
+    };
+
+    let expected: Vec<Vec<u8>> = payloads.iter().map(|p| p.to_vec()).collect();
+    assert_eq!(received, expected);
+}
+
+#[test]
+fn fixed_bytes_too_large_error() {
+    let err = FixedBytes::<4>::new(b"hello").unwrap_err();
+    assert_eq!(err, BctowError::MessageTooLarge { size: 5, max: 4 });
 }
