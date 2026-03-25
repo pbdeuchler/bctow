@@ -9,10 +9,12 @@ bctow: generic typed pub/sub ring buffer library (Rust)
 ## Key types
 - Producer<T>: publish(&T)/publish_id(TopicId, &T), register_topic() — Send not Sync, cached ring refs avoid lock on hot path
 - ConsumerContext<T>: Clone, create_client() → ConsumerClient<T>
-- ConsumerClient<T>: subscribe/unsubscribe, poll() → Option<ReceivedMessage<'_, T>>, poll_into(&mut MaybeUninit<T>) → Option<TopicId>
+- ConsumerClient<T>: subscribe/subscribe_id, unsubscribe(TopicId)/unsubscribe_by_name, poll() → Option<ReceivedMessage<'_, T>>, poll_into(&mut MaybeUninit<T>) → Option<TopicId>
 - ReceivedMessage<'a, T>: {topic_id: TopicId, message: &'a T}
 - TopicId: broker-branded (broker_id + index), not generic
 - BctowConfig: {ring_buffer_capacity: usize, overflow_policy: OverflowPolicy} — NO max_payload_size
+- Producer::topic_name(TopicId) → Option<String> and ConsumerContext::topic_name(TopicId) → Option<String> both resolve id to topic string
+- publish/publish_id return Result<u64, BctowError> where u64 is the slot sequence number
 
 ## Ring protocol
 - Slot<T>: version(AtomicU64 even=stable/odd=writer), readers(AtomicUsize), sequence(AtomicU64), data(UnsafeCell<MaybeUninit<T>>)

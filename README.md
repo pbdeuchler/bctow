@@ -7,7 +7,7 @@ Buffalo Chicken Tender on White, now as a generic typed topic pub/sub library fo
 - Messages are generic typed values, not byte slices, so the compiler ensures type safety across publish and subscribe.
 - Topic ids are broker-branded, so a `TopicId` from one broker is rejected by another.
 - Topic rings preallocate slot storage and copy typed values into those slots instead of allocating an `Arc` per message.
-- Consumers copy into an internal scratch buffer with `poll()` or a caller-provided buffer with `poll_into()`.
+- Consumers copy into an internal scratch buffer with `poll()` or a caller-provided `MaybeUninit<T>` with `poll_into()`.
 
 ## Quick example
 
@@ -43,6 +43,9 @@ cargo run --all-features --example basic
 - One shared fixed-capacity ring per topic.
 - No broker lock on steady-state `publish_id` after the producer caches the topic.
 - No allocations in steady-state publish or receive paths.
+- `publish` and `publish_id` return `Result<u64, BctowError>` where the `u64` is the slot sequence number.
+- `ConsumerClient` supports `subscribe`/`subscribe_id`, `unsubscribe(TopicId)`, and `unsubscribe_by_name`.
+- Both `Producer` and `ConsumerContext` expose `topic_name(TopicId) -> Option<String>`.
 - Overflow policies: `DropOldest`, `DropNewest`, `SkipToLatest`.
 
 ## Variable-length byte payloads
