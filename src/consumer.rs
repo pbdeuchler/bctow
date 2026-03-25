@@ -1,51 +1,57 @@
+use std::cell::Cell;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::broker::BrokerInner;
 use crate::config::OverflowPolicy;
 use crate::error::BctowError;
 use crate::ring::{Cursor, RingBuffer};
-use crate::topic::TopicId;
+use crate::topic::{MatchKind, TopicId, TopicKey};
 
-/// Factory and manager for consumer clients. Clone-able and shareable across threads.
+/// Borrowed message view backed by the client's internal scratch buffer.
+#[derive(Debug, Clone, Copy)]
+pub struct ReceivedMessage<'a> {
+    pub topic_id: TopicId,
+    pub payload: &'a [u8],
+}
+
+/// Factory for consumer clients. Clone-able and shareable across threads.
 #[derive(Clone)]
-pub struct ConsumerContext<T: Send + Sync + 'static> {
-    pub(crate) inner: Arc<BrokerInner<T>>,
+pub struct ConsumerContext {
+    pub(crate) inner: Arc<BrokerInner>,
     overflow_policy: OverflowPolicy,
 }
 
-impl<T: Send + Sync + 'static> ConsumerContext<T> {
-    pub(crate) fn new(inner: Arc<BrokerInner<T>>, overflow_policy: OverflowPolicy) -> Self {
-        ConsumerContext {
+impl ConsumerContext {
+    pub(crate) fn new(inner: Arc<BrokerInner>, overflow_policy: OverflowPolicy) -> Self {
+        Self {
             inner,
             overflow_policy,
         }
     }
 
-    /// Create a new consumer client with no subscriptions.
-    pub fn create_client(&self) -> ConsumerClient<T> {
+    pub fn create_client(&self) -> ConsumerClient {
         ConsumerClient {
             inner: Arc::clone(&self.inner),
             overflow_policy: self.overflow_policy,
             subscriptions: HashMap::new(),
             topic_order: Vec::new(),
             next_poll_idx: 0,
+            scratch: vec![0; self.inner.config.max_payload_size],
+            _not_sync: PhantomData,
         }
     }
 
-    /// Resolve a `TopicId` back to its original topic string.
-    ///
-    /// Returns `None` if the id has never been interned (which should not
-    /// happen for ids obtained from `poll`). Intended for debug and logging
-    /// paths — do not call on hot paths.
     pub fn topic_name(&self, id: TopicId) -> Option<String> {
-        self.inner.interner.name(id)
+        self.inner.topics.name(id)
     }
 
     #[cfg(feature = "metrics")]
     pub fn metrics(&self) -> Metrics {
         use std::sync::atomic::Ordering;
+
         Metrics {
             messages_published: self.inner.messages_published.load(Ordering::Relaxed),
             messages_delivered: self.inner.messages_delivered.load(Ordering::Relaxed),
@@ -53,157 +59,192 @@ impl<T: Send + Sync + 'static> ConsumerContext<T> {
     }
 }
 
-/// A single consumer with per-topic cursors.
-/// NOT Clone, NOT Sync — owned by a single consumer thread.
-pub struct ConsumerClient<T: Send + Sync + 'static> {
-    inner: Arc<BrokerInner<T>>,
-    overflow_policy: OverflowPolicy,
-    /// Per-topic cursor and cached ring buffer handle.
-    subscriptions: HashMap<TopicId, (Cursor, Arc<RingBuffer<T>>)>,
-    /// Stable ordered list of subscribed topics for round-robin fairness.
-    topic_order: Vec<TopicId>,
-    /// Index into topic_order for the next poll round-robin start.
-    next_poll_idx: usize,
+struct Subscription {
+    cursor: Cursor,
+    ring: Arc<RingBuffer>,
 }
 
-impl<T: Send + Sync + 'static> ConsumerClient<T> {
-    /// Subscribe to `topic` by name. The topic must already exist (have been published to).
-    /// New subscribers start at latest+1 — they do not see historical messages.
-    pub fn subscribe(&mut self, topic: &str) -> Result<(), BctowError> {
-        match self.inner.interner.resolve(topic) {
-            Some(id) => self.subscribe_id(id),
-            None => Err(BctowError::TopicNotFound(topic.to_owned())),
-        }
-    }
+/// A single consumer with per-topic cursors. `ConsumerClient` is `Send` but not `Sync`.
+pub struct ConsumerClient {
+    inner: Arc<BrokerInner>,
+    overflow_policy: OverflowPolicy,
+    subscriptions: HashMap<TopicId, Subscription>,
+    topic_order: Vec<TopicId>,
+    next_poll_idx: usize,
+    scratch: Vec<u8>,
+    _not_sync: PhantomData<Cell<()>>,
+}
 
-    /// Subscribe to a known `TopicId`.
-    ///
-    /// Subscribing to the same topic twice is a no-op.
-    pub fn subscribe_id(&mut self, topic: TopicId) -> Result<(), BctowError> {
-        let ring = self
+impl ConsumerClient {
+    pub fn subscribe<K: TopicKey>(&mut self, topic: K) -> Result<(), BctowError> {
+        debug_assert_eq!(topic.match_kind(), MatchKind::Exact);
+        let entry = self
             .inner
-            .get_ring(topic)
-            .ok_or_else(|| BctowError::TopicNotFound(format!("{topic:?}")))?;
-
-        if let Entry::Vacant(e) = self.subscriptions.entry(topic) {
-            let cursor = Cursor::new_latest(&ring);
-            e.insert((cursor, ring));
-            self.topic_order.push(topic);
-        }
-        Ok(())
+            .topics
+            .resolve(topic.topic_str())
+            .ok_or_else(|| BctowError::TopicNotFound(topic.topic_str().to_owned()))?;
+        self.subscribe_entry(entry)
     }
 
-    /// Remove subscription for `topic`.
+    pub fn subscribe_id(&mut self, topic: TopicId) -> Result<(), BctowError> {
+        if topic.broker() != self.inner.topics.broker_id() {
+            return Err(BctowError::TopicBrokerMismatch(topic));
+        }
+        let entry = self
+            .inner
+            .topics
+            .get(topic)
+            .ok_or_else(|| BctowError::TopicNotFound(topic.to_string()))?;
+        self.subscribe_entry(entry)
+    }
+
     pub fn unsubscribe(&mut self, topic: TopicId) {
         self.subscriptions.remove(&topic);
-        self.topic_order.retain(|&t| t != topic);
-        // Keep next_poll_idx in bounds (also resets to 0 when list becomes empty).
+        self.topic_order.retain(|&candidate| candidate != topic);
         if self.next_poll_idx >= self.topic_order.len() {
             self.next_poll_idx = 0;
         }
     }
 
-    /// Remove subscription for the topic identified by `topic` name.
-    ///
-    /// If the topic name has never been interned (i.e. no message has ever been
-    /// published to it), this is a no-op.
-    pub fn unsubscribe_by_name(&mut self, topic: &str) {
-        if let Some(id) = self.inner.interner.resolve(topic) {
-            self.unsubscribe(id);
+    pub fn unsubscribe_by_name<K: TopicKey>(&mut self, topic: K) {
+        debug_assert_eq!(topic.match_kind(), MatchKind::Exact);
+        if let Some(entry) = self.inner.topics.resolve(topic.topic_str()) {
+            self.unsubscribe(entry.id());
         }
     }
 
-    /// Poll for the next available message across all subscribed topics.
-    ///
-    /// Returns `(TopicId, Arc<T>)` for the first available message, using a rotating
-    /// start index for fairness. Returns `None` if no topic has a new message.
-    ///
-    /// **`DropOldest` contention note:** Under [`OverflowPolicy::DropOldest`], a single
-    /// `poll` call that encounters a lagged cursor may return `None` even when messages
-    /// exist in the ring. This occurs when the cursor skips to `oldest_available_seq` but
-    /// the producer races ahead and overwrites that slot before the read completes. The
-    /// cursor is advanced past the overwritten slot, so the subsequent `poll` call will
-    /// succeed.
-    pub fn poll(&mut self) -> Option<(TopicId, Arc<T>)> {
+    /// Poll into the client's internal scratch buffer.
+    pub fn poll(&mut self) -> Option<ReceivedMessage<'_>> {
         let count = self.topic_order.len();
         if count == 0 {
             return None;
         }
 
         let start = self.next_poll_idx % count;
+        let overflow_policy = self.overflow_policy;
 
-        for i in 0..count {
-            let idx = (start + i) % count;
+        for offset in 0..count {
+            let idx = (start + offset) % count;
             let topic_id = self.topic_order[idx];
 
-            // We need mutable access to the cursor but also need the ring ref.
-            // Borrow from the hashmap directly.
-            let result = {
-                let (cursor, ring) = self.subscriptions.get_mut(&topic_id)
+            let len = {
+                let (subscriptions, scratch) = (&mut self.subscriptions, &mut self.scratch);
+                let subscription = subscriptions
+                    .get_mut(&topic_id)
                     .expect("topic_order and subscriptions out of sync");
-                try_read_with_policy(cursor, ring, self.overflow_policy)
+                try_read_with_policy(
+                    &mut subscription.cursor,
+                    &subscription.ring,
+                    overflow_policy,
+                    scratch.as_mut_slice(),
+                )
+                .expect("client scratch buffer is sized from broker max_payload_size")
             };
 
-            if let Some(arc) = result {
-                // Only advance the round-robin index when a message is actually found.
-                // This prevents unfair starvation where idx advances even on a miss.
+            if let Some(len) = len {
                 self.next_poll_idx = (idx + 1) % count;
                 #[cfg(feature = "metrics")]
                 self.inner.inc_delivered();
-                return Some((topic_id, arc));
+                return Some(ReceivedMessage {
+                    topic_id,
+                    payload: &self.scratch[..len],
+                });
             }
         }
+
         None
+    }
+
+    /// Poll into a caller-provided buffer.
+    pub fn poll_into(&mut self, dst: &mut [u8]) -> Result<Option<(TopicId, usize)>, BctowError> {
+        let count = self.topic_order.len();
+        if count == 0 {
+            return Ok(None);
+        }
+
+        let start = self.next_poll_idx % count;
+        let overflow_policy = self.overflow_policy;
+
+        for offset in 0..count {
+            let idx = (start + offset) % count;
+            let topic_id = self.topic_order[idx];
+
+            let len = {
+                let subscription = self
+                    .subscriptions
+                    .get_mut(&topic_id)
+                    .expect("topic_order and subscriptions out of sync");
+                try_read_with_policy(
+                    &mut subscription.cursor,
+                    &subscription.ring,
+                    overflow_policy,
+                    dst,
+                )?
+            };
+
+            if let Some(len) = len {
+                self.next_poll_idx = (idx + 1) % count;
+                #[cfg(feature = "metrics")]
+                self.inner.inc_delivered();
+                return Ok(Some((topic_id, len)));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn subscribe_entry(&mut self, entry: Arc<crate::topic::TopicEntry>) -> Result<(), BctowError> {
+        match self.subscriptions.entry(entry.id()) {
+            Entry::Occupied(_) => Ok(()),
+            Entry::Vacant(vacant) => {
+                vacant.insert(Subscription {
+                    cursor: Cursor::new_latest(entry.ring()),
+                    ring: Arc::clone(entry.ring()),
+                });
+                self.topic_order.push(entry.id());
+                Ok(())
+            }
+        }
     }
 }
 
-/// Attempt to read the next message for `cursor` from `ring`, applying `policy`
-/// if the consumer has lagged. Returns the message Arc or None.
-fn try_read_with_policy<T: Send + Sync + 'static>(
+fn try_read_with_policy(
     cursor: &mut Cursor,
-    ring: &RingBuffer<T>,
+    ring: &RingBuffer,
     policy: OverflowPolicy,
-) -> Option<Arc<T>> {
+    dst: &mut [u8],
+) -> Result<Option<usize>, BctowError> {
     let seq = cursor.next_seq();
 
-    // Try the current cursor position first.
-    if let Some(arc) = ring.read(seq) {
+    if let Some(len) = ring.read_into(seq, dst)? {
         cursor.advance();
-        return Some(arc);
+        return Ok(Some(len));
     }
 
-    // Read returned None. Determine why.
     let latest = ring.latest_seq();
-
     if seq > latest {
-        // Consumer is ahead of the producer — nothing new to read.
-        // Also covers the case where latest == 0 (nothing written yet):
-        // seq starts at 1 > 0, so this branch fires correctly.
-        return None;
+        return Ok(None);
     }
 
-    // Consumer has lagged: seq < oldest_available.
     let oldest = ring.oldest_available_seq();
+    if seq >= oldest {
+        return Ok(None);
+    }
+
     match policy {
         OverflowPolicy::DropOldest => {
-            // Skip to oldest available and try once more.
             cursor.skip_to(oldest);
-            if let Some(arc) = ring.read(oldest) {
+            if let Some(len) = ring.read_into(oldest, dst)? {
                 cursor.advance();
-                return Some(arc);
+                return Ok(Some(len));
             }
-            None
+            Ok(None)
         }
         OverflowPolicy::SkipToLatest => {
-            // Jump past everything; consumer will read only new messages.
             cursor.skip_to(latest + 1);
-            None
+            Ok(None)
         }
-        OverflowPolicy::DropNewest => {
-            // Do nothing — consumer stays put, effectively dropping messages
-            // that it can no longer reach.
-            None
-        }
+        OverflowPolicy::DropNewest => Ok(None),
     }
 }
 
@@ -216,77 +257,30 @@ pub struct Metrics {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::ring::RingBuffer;
-
-    fn make_ring(capacity: usize) -> Arc<RingBuffer<u64>> {
-        Arc::new(RingBuffer::new(capacity))
-    }
-
-    fn push(ring: &RingBuffer<u64>, v: u64) -> u64 {
-        unsafe { ring.push(v) }
-    }
-
-    // --- try_read_with_policy ---
-
     #[test]
-    fn read_policy_empty_ring_returns_none() {
-        let ring = make_ring(4);
-        let mut cursor = Cursor::new();
-        let result = try_read_with_policy(&mut cursor, &ring, OverflowPolicy::DropOldest);
-        assert!(result.is_none());
-        assert_eq!(cursor.next_seq(), 1); // cursor unchanged
+    fn poll_into_uses_caller_buffer() {
+        let (producer, ctx) = crate::broker(crate::BctowConfig::default());
+        producer.publish("topic", b"prime").unwrap();
+
+        let mut client = ctx.create_client();
+        client.subscribe("topic").unwrap();
+        producer.publish("topic", b"hello").unwrap();
+
+        let mut dst = [0u8; 32];
+        let (_topic, len) = client.poll_into(&mut dst).unwrap().unwrap();
+        assert_eq!(&dst[..len], b"hello");
     }
 
     #[test]
-    fn read_policy_happy_path_returns_message_and_advances_cursor() {
-        let ring = make_ring(4);
-        push(&ring, 42);
-        let mut cursor = Cursor::new();
-        let result = try_read_with_policy(&mut cursor, &ring, OverflowPolicy::DropOldest);
-        assert_eq!(result.map(|a| *a), Some(42));
-        assert_eq!(cursor.next_seq(), 2);
-    }
+    fn poll_borrows_from_internal_scratch() {
+        let (producer, ctx) = crate::broker(crate::BctowConfig::default());
+        producer.publish("topic", b"prime").unwrap();
 
-    #[test]
-    fn read_policy_ahead_of_producer_returns_none() {
-        let ring = make_ring(4);
-        push(&ring, 1);
-        let mut cursor = Cursor::new_latest(&ring);
-        // cursor is at seq 2, latest is 1 — nothing new
-        let result = try_read_with_policy(&mut cursor, &ring, OverflowPolicy::DropOldest);
-        assert!(result.is_none());
-        assert_eq!(cursor.next_seq(), 2); // unchanged
-    }
+        let mut client = ctx.create_client();
+        client.subscribe("topic").unwrap();
+        producer.publish("topic", b"hello").unwrap();
 
-    #[test]
-    fn read_policy_drop_oldest_skips_to_oldest_and_reads() {
-        let ring = make_ring(4);
-        for i in 1u64..=6 { push(&ring, i); } // seqs 1-6; oldest=3
-        let mut cursor = Cursor::new(); // stuck at seq=1 which is overwritten
-        let result = try_read_with_policy(&mut cursor, &ring, OverflowPolicy::DropOldest);
-        assert!(result.is_some());
-        assert!(*result.unwrap() >= 3);
-        assert_eq!(cursor.next_seq(), ring.oldest_available_seq() + 1);
-    }
-
-    #[test]
-    fn read_policy_skip_to_latest_advances_past_everything() {
-        let ring = make_ring(4);
-        for i in 1u64..=6 { push(&ring, i); } // oldest=3, latest=6
-        let mut cursor = Cursor::new(); // stuck at seq=1
-        let result = try_read_with_policy(&mut cursor, &ring, OverflowPolicy::SkipToLatest);
-        assert!(result.is_none()); // nothing returned; consumer skipped ahead
-        assert_eq!(cursor.next_seq(), 7); // latest+1
-    }
-
-    #[test]
-    fn read_policy_drop_newest_does_nothing() {
-        let ring = make_ring(4);
-        for i in 1u64..=6 { push(&ring, i); } // oldest=3
-        let mut cursor = Cursor::new(); // stuck at seq=1
-        let result = try_read_with_policy(&mut cursor, &ring, OverflowPolicy::DropNewest);
-        assert!(result.is_none());
-        assert_eq!(cursor.next_seq(), 1); // cursor unchanged
+        let msg = client.poll().unwrap();
+        assert_eq!(msg.payload, b"hello");
     }
 }

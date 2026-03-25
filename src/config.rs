@@ -1,33 +1,27 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OverflowPolicy {
-    /// Oldest messages are overwritten when the buffer is full.
+    /// A lagging consumer skips to the oldest message still retained in the ring.
     #[default]
     DropOldest,
-    /// A lagging consumer's cursor stays in place; the consumer becomes stuck
-    /// and will not receive further messages until re-subscribed.
+    /// A lagging consumer stays pinned to its old cursor and stops making progress.
     DropNewest,
-    /// A lagging consumer jumps to the latest message on overrun.
+    /// A lagging consumer jumps to `latest + 1` and only sees future messages.
     SkipToLatest,
 }
 
 #[derive(Debug, Clone)]
 pub struct BctowConfig {
-    /// Maximum payload size in bytes. Default: 16384 (16KB).
-    ///
-    /// **Reserved for future use.** For a generic `T`, the wire size of a
-    /// message is not known at the broker level, so this field is not checked
-    /// today. It will be enforced by a future implementation that constrains
-    /// `T` to a byte-oriented trait (e.g. `AsRef<[u8]>`).
+    /// Maximum message payload size in bytes.
     pub max_payload_size: usize,
-    /// Number of slots in the ring buffer per topic. Default: 1024.
+    /// Number of slots in the per-topic ring buffer.
     pub ring_buffer_capacity: usize,
-    /// Policy applied when the buffer is full. Default: DropOldest.
+    /// Policy applied when a consumer falls behind retention.
     pub overflow_policy: OverflowPolicy,
 }
 
 impl Default for BctowConfig {
     fn default() -> Self {
-        BctowConfig {
+        Self {
             max_payload_size: 16_384,
             ring_buffer_capacity: 1_024,
             overflow_policy: OverflowPolicy::default(),

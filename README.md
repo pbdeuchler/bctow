@@ -1,74 +1,50 @@
 # bctow
 
-Buffalo Chicken Tender on White — a high-performance, in-process, topic-based pub/sub library for Rust.
+Buffalo Chicken Tender on White, now as a byte-oriented topic pub/sub library for Rust.
 
-## Key features
+## What changed
 
-- **Single producer, multiple consumers** — one writer thread, any number of reader threads, no runtime mutex on the publish hot path.
-- **Per-topic ring buffers** — slots pre-allocated at topic creation; steady-state publish cost is a single `Arc` allocation per message.
-- **Lock-free reads** — consumers read from the ring using `Acquire`/`Release` atomics.
-- **Per-client cursors** — each `ConsumerClient` tracks its own position; consumers never block each other.
-- **Round-robin fairness** — `poll` rotates across subscribed topics so a high-throughput topic cannot starve others.
-- **Three overflow policies** — `DropOldest` (default), `DropNewest`, `SkipToLatest`.
-- **No async runtime required** — pure `std`, works in any threading model.
-
-## Design constraints
-
-- **One producer per broker.** `Producer` is `Send` but `!Sync`; the compiler prevents concurrent `publish` calls.
-- **Bounded memory.** Ring buffer capacity is fixed at creation; slow consumers experience the configured overflow policy rather than back-pressuring the producer.
-- **Topics created on first publish.** A `subscribe` call to a never-published topic returns `BctowError::TopicNotFound`.
-- **New subscribers see only future messages.** Cursors start at `latest + 1`; historical messages within the ring window are not replayed.
+- Payloads are byte slices, not generic `T`, so `max_payload_size` is enforced on every publish.
+- Topic ids are broker-branded, so a `TopicId` from one broker is rejected by another.
+- Topic rings preallocate slot storage and copy payload bytes into those slots instead of allocating an `Arc` per message.
+- Consumers copy into an internal scratch buffer with `poll()` or a caller-provided buffer with `poll_into()`.
 
 ## Quick example
 
 ```rust
-use bctow::{BctowConfig, broker};
+use bctow::{broker, BctowConfig};
 
-fn main() {
-    let config = BctowConfig::default();
+fn main() -> Result<(), bctow::BctowError> {
+    let (producer, ctx) = broker(BctowConfig::default());
 
-    // broker() returns a matched Producer + ConsumerContext pair.
-    let (producer, ctx) = broker::<String>(config);
+    let topic = producer.register_topic("events/sensor");
+    producer.publish_id(topic, b"temp=42")?;
 
-    // Publish to two topics — topics are created on first publish.
-    for i in 0..4u32 {
-        producer.publish("sensors/temperature", format!("temp={i}"));
-        producer.publish("sensors/humidity",    format!("hum={i}"));
-    }
-
-    // Create a consumer client and subscribe.
     let mut client = ctx.create_client();
-    client.subscribe("sensors/temperature").unwrap();
-    client.subscribe("sensors/humidity").unwrap();
+    client.subscribe_id(topic)?;
 
-    // Publish more messages after subscribing.
-    producer.publish("sensors/temperature", "temp=after".to_owned());
-    producer.publish("sensors/humidity",    "hum=after".to_owned());
+    producer.publish("events/sensor", b"temp=43")?;
 
-    // poll() returns (TopicId, Arc<T>) and rotates across topics for fairness.
-    while let Some((topic_id, msg)) = client.poll() {
-        println!("{topic_id:?}: {msg}");
-    }
-
-    // Unsubscribe at any time.
-    client.unsubscribe_by_name("sensors/humidity");
+    let message = client.poll().unwrap();
+    assert_eq!(message.payload, b"temp=43");
+    Ok(())
 }
 ```
 
-Run the full annotated example with:
+Run the example with:
 
 ```bash
-cargo run --all-features --example basic
+cargo run --example basic
 ```
 
-## Overflow policies
+## Design notes
 
-| Policy         | Behaviour when consumer lags                          |
-|----------------|-------------------------------------------------------|
-| `DropOldest`   | Skip cursor to oldest available message (default)     |
-| `DropNewest`   | Cursor stays in place; consumer becomes stuck and receives no further messages until re-subscribed |
-| `SkipToLatest` | Jump cursor past latest message; skip entire backlog  |
+- One producer, many consumers.
+- One shared fixed-capacity ring per topic.
+- No broker lock on steady-state `publish_id` after the producer caches the topic.
+- No allocations in steady-state publish or receive paths.
+- Overflow policies: `DropOldest`, `DropNewest`, `SkipToLatest`.
 
-## Optional features
+## Optional feature
 
-- `metrics` — exposes `ConsumerContext::metrics()` returning `Metrics { messages_published, messages_delivered }`.
+- `metrics`: exposes `ConsumerContext::metrics()` with relaxed-atomic counters.

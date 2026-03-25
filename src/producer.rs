@@ -1,66 +1,103 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::broker::BrokerInner;
-use crate::topic::TopicId;
+use crate::error::BctowError;
+use crate::topic::{MatchKind, TopicEntry, TopicId, TopicKey};
 
-/// Single-producer handle. There must be exactly one Producer per broker.
-/// `Send` but not `Sync` — only one thread may call `publish` at a time.
-pub struct Producer<T: Send + Sync + 'static> {
-    pub(crate) inner: Arc<BrokerInner<T>>,
-    /// Prevents `Producer` from being `Sync`. This enforces the single-producer
-    /// invariant: only one thread can call `publish` at a time. Without this,
-    /// the compiler would auto-derive `Sync` from `Arc<BrokerInner<T>>`, allowing
-    /// callers to wrap `Producer` in an `Arc` and call `publish` concurrently.
+/// Single-producer handle. `Producer` is `Send` but not `Sync`.
+pub struct Producer {
+    pub(crate) inner: Arc<BrokerInner>,
+    pub(crate) cached_rings: RefCell<Vec<Option<Arc<crate::ring::RingBuffer>>>>,
     pub(crate) _not_sync: PhantomData<Cell<()>>,
 }
 
-impl<T: Send + Sync + 'static> Producer<T> {
-    /// Publish `msg` to `topic`. Creates the topic and its ring buffer on first use.
-    ///
-    /// Returns the sequence number assigned to the message.
-    #[inline]
-    pub fn publish(&self, topic: &str, msg: T) -> u64 {
-        let id = self.inner.interner.intern(topic);
-        self.publish_id(id, msg)
+impl Producer {
+    /// Register `topic` if needed and return its stable broker-branded id.
+    pub fn register_topic<K: TopicKey>(&self, topic: K) -> TopicId {
+        debug_assert_eq!(topic.match_kind(), MatchKind::Exact);
+        let entry = self.inner.topics.get_or_create(topic.topic_str());
+        self.cache_entry(&entry);
+        entry.id()
     }
 
-    /// Resolve a `TopicId` back to its original topic string.
+    /// Publish `payload` to `topic`, creating the topic on first use.
+    pub fn publish<K: TopicKey>(
+        &self,
+        topic: K,
+        payload: impl AsRef<[u8]>,
+    ) -> Result<u64, BctowError> {
+        debug_assert_eq!(topic.match_kind(), MatchKind::Exact);
+        let entry = self.inner.topics.get_or_create(topic.topic_str());
+        self.cache_entry(&entry);
+        self.publish_entry(&entry, payload.as_ref())
+    }
+
+    /// Publish directly to a known topic id.
     ///
-    /// Returns `None` if the id has never been interned. Intended for debug
-    /// and logging paths — do not call on hot paths.
+    /// Once a topic has been cached in this producer, steady-state `publish_id`
+    /// avoids broker registry locks.
+    pub fn publish_id(&self, topic: TopicId, payload: impl AsRef<[u8]>) -> Result<u64, BctowError> {
+        if topic.broker() != self.inner.topics.broker_id() {
+            return Err(BctowError::TopicBrokerMismatch(topic));
+        }
+
+        let payload = payload.as_ref();
+        self.ensure_payload_size(payload)?;
+
+        let index = topic.index() as usize;
+        {
+            let cache = self.cached_rings.borrow();
+            if let Some(Some(ring)) = cache.get(index) {
+                let seq = ring.push(payload);
+                #[cfg(feature = "metrics")]
+                self.inner.inc_published();
+                return Ok(seq);
+            }
+        }
+
+        let entry = self
+            .inner
+            .topics
+            .get(topic)
+            .ok_or_else(|| BctowError::TopicNotFound(topic.to_string()))?;
+        self.cache_entry(&entry);
+        self.publish_entry(&entry, payload)
+    }
+
+    /// Resolve a topic id back to its original topic string.
     pub fn topic_name(&self, id: TopicId) -> Option<String> {
-        self.inner.interner.name(id)
+        self.inner.topics.name(id)
     }
 
-    /// Intern `topic` and return its `TopicId` without publishing a message.
-    ///
-    /// Use this to obtain a `TopicId` for repeated `publish_id` calls, avoiding
-    /// the string interning overhead on every publish.  The topic will not be
-    /// visible to consumers (i.e. `subscribe` will fail) until at least one
-    /// message has been published to it.
-    pub fn intern_topic(&self, topic: &str) -> TopicId {
-        self.inner.interner.intern(topic)
-    }
-
-    /// Publish `msg` directly to a known `TopicId`. Hot path — no string work.
-    ///
-    /// Returns the sequence number assigned to the message.
-    ///
-    /// **Note:** If `topic` has not been interned in this broker, a new ring
-    /// buffer is created. Callers should use [`Producer::intern_topic`] or
-    /// [`Producer::publish`] to obtain valid `TopicId`s.
-    #[inline]
-    pub fn publish_id(&self, topic: TopicId, msg: T) -> u64 {
-        let ring = self.inner.get_or_create_ring(topic);
-        // SAFETY: Producer is the sole caller of push. The single-producer
-        // invariant is upheld by the type system: there is exactly one Producer
-        // per broker and it is !Sync (PhantomData<Cell<()>>), so push can only
-        // be called from one thread at a time.
-        let seq = unsafe { ring.push(msg) };
+    fn publish_entry(&self, entry: &Arc<TopicEntry>, payload: &[u8]) -> Result<u64, BctowError> {
+        self.ensure_payload_size(payload)?;
+        let seq = entry.ring().push(payload);
         #[cfg(feature = "metrics")]
         self.inner.inc_published();
-        seq
+        Ok(seq)
+    }
+
+    fn ensure_payload_size(&self, payload: &[u8]) -> Result<(), BctowError> {
+        let max = self.inner.config.max_payload_size;
+        if payload.len() > max {
+            return Err(BctowError::PayloadTooLarge {
+                size: payload.len(),
+                max,
+            });
+        }
+        Ok(())
+    }
+
+    fn cache_entry(&self, entry: &Arc<TopicEntry>) {
+        let index = entry.id().index() as usize;
+        let mut cache = self.cached_rings.borrow_mut();
+        if cache.len() <= index {
+            cache.resize_with(index + 1, || None);
+        }
+        if cache[index].is_none() {
+            cache[index] = Some(Arc::clone(entry.ring()));
+        }
     }
 }

@@ -1,31 +1,45 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
-/// Compact identifier for a topic. Used on hot paths — no string work involved.
+use crate::ring::RingBuffer;
+
+static NEXT_BROKER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Compact identifier for a topic.
+///
+/// Topic ids are broker-branded so an id obtained from one broker instance
+/// cannot be used against another.
 #[derive(Copy, Clone, Hash, Eq, PartialEq, Debug)]
-pub struct TopicId(pub(crate) u32);
+pub struct TopicId {
+    broker: u64,
+    index: u32,
+}
+
+impl TopicId {
+    pub fn broker(self) -> u64 {
+        self.broker
+    }
+
+    pub fn index(self) -> u32 {
+        self.index
+    }
+}
 
 impl fmt::Display for TopicId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}:{}", self.broker, self.index)
     }
 }
 
 /// Describes how a topic key should be matched against subscriptions.
-/// Only `Exact` is implemented; the enum exists so future variants
-/// (`Prefix`, `Wildcard`, …) can be added without breaking callers.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum MatchKind {
     Exact,
 }
 
 /// Anything that can be used to identify a topic for publish/subscribe.
-///
-/// This trait exists for forward compatibility: today only exact-string matching
-/// is implemented, but future variants (`PrefixTopic`, `WildcardTopic`, …) will
-/// implement `TopicKey` so callers can pass any key type to a unified API without
-/// breaking existing code.
 pub trait TopicKey {
     fn topic_str(&self) -> &str;
     fn match_kind(&self) -> MatchKind;
@@ -37,7 +51,7 @@ pub struct ExactTopic(pub(crate) String);
 
 impl ExactTopic {
     pub fn new(s: impl Into<String>) -> Self {
-        ExactTopic(s.into())
+        Self(s.into())
     }
 }
 
@@ -61,207 +75,211 @@ impl TopicKey for &str {
     }
 }
 
-/// Placeholder for future pattern-based matching (prefix, wildcard, …).
-/// Not constructible outside this module.
+impl TopicKey for String {
+    fn topic_str(&self) -> &str {
+        self.as_str()
+    }
+
+    fn match_kind(&self) -> MatchKind {
+        MatchKind::Exact
+    }
+}
+
+/// Placeholder for future pattern-based matching.
 #[derive(Debug)]
 pub struct TopicPattern {
     _private: (),
 }
 
-/// Thread-safe bidirectional mapping between topic strings and `TopicId`s.
-///
-/// Write lock is only acquired when a truly new topic is first interned;
-/// all subsequent lookups use a read lock.
-pub struct TopicInterner {
-    inner: RwLock<InternerInner>,
+pub(crate) struct TopicEntry {
+    id: TopicId,
+    name: String,
+    ring: Arc<RingBuffer>,
 }
 
-struct InternerInner {
-    map: HashMap<String, TopicId>,
-    names: Vec<String>,
+impl TopicEntry {
+    pub(crate) fn id(&self) -> TopicId {
+        self.id
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn ring(&self) -> &Arc<RingBuffer> {
+        &self.ring
+    }
 }
 
-impl TopicInterner {
-    pub fn new() -> Self {
-        TopicInterner {
-            inner: RwLock::new(InternerInner {
-                map: HashMap::new(),
-                names: Vec::new(),
+struct RegistryInner {
+    by_name: HashMap<String, TopicId>,
+    topics: Vec<Arc<TopicEntry>>,
+}
+
+/// Thread-safe mapping between topic strings, topic ids, and per-topic rings.
+pub(crate) struct TopicRegistry {
+    broker_id: u64,
+    ring_buffer_capacity: usize,
+    max_payload_size: usize,
+    inner: RwLock<RegistryInner>,
+}
+
+impl TopicRegistry {
+    pub(crate) fn new(ring_buffer_capacity: usize, max_payload_size: usize) -> Self {
+        Self {
+            broker_id: NEXT_BROKER_ID.fetch_add(1, Ordering::Relaxed),
+            ring_buffer_capacity,
+            max_payload_size,
+            inner: RwLock::new(RegistryInner {
+                by_name: HashMap::new(),
+                topics: Vec::new(),
             }),
         }
     }
 
-    /// Return the `TopicId` for `key`, creating one if this is the first time
-    /// the string has been seen. Allocates only on the first call for each
-    /// unique string.
-    pub fn intern(&self, key: &str) -> TopicId {
-        // Fast path: read lock only.
+    pub(crate) fn broker_id(&self) -> u64 {
+        self.broker_id
+    }
+
+    pub(crate) fn get_or_create(&self, key: &str) -> Arc<TopicEntry> {
         {
-            let guard = self.inner.read().expect("topic interner read lock poisoned");
-            if let Some(&id) = guard.map.get(key) {
-                return id;
+            let guard = self
+                .inner
+                .read()
+                .expect("topic registry read lock poisoned");
+            if let Some(&id) = guard.by_name.get(key) {
+                return Arc::clone(
+                    guard
+                        .topics
+                        .get(id.index as usize)
+                        .expect("topic registry index out of sync"),
+                );
             }
         }
 
-        // Slow path: write lock to insert.
         let mut guard = self
             .inner
             .write()
-            .expect("topic interner write lock poisoned");
+            .expect("topic registry write lock poisoned");
 
-        // Re-check after acquiring write lock (another thread may have raced us).
-        if let Some(&id) = guard.map.get(key) {
-            return id;
+        if let Some(&id) = guard.by_name.get(key) {
+            return Arc::clone(
+                guard
+                    .topics
+                    .get(id.index as usize)
+                    .expect("topic registry index out of sync"),
+            );
         }
 
-        let len = guard.names.len();
-        assert!(len <= u32::MAX as usize, "topic interner overflow: exceeded u32::MAX topics");
-        let id = TopicId(len as u32);
-        let owned = key.to_owned();
-        guard.map.insert(owned.clone(), id);
-        guard.names.push(owned);
-        id
+        let index = guard.topics.len();
+        assert!(
+            index <= u32::MAX as usize,
+            "topic registry overflow: exceeded u32::MAX topics"
+        );
+
+        let id = TopicId {
+            broker: self.broker_id,
+            index: index as u32,
+        };
+        let entry = Arc::new(TopicEntry {
+            id,
+            name: key.to_owned(),
+            ring: Arc::new(RingBuffer::new(
+                self.ring_buffer_capacity,
+                self.max_payload_size,
+            )),
+        });
+        guard.by_name.insert(entry.name.clone(), id);
+        guard.topics.push(Arc::clone(&entry));
+        entry
     }
 
-    /// Look up `key` without allocating. Returns `None` if the topic has
-    /// never been interned.
-    pub fn resolve(&self, key: &str) -> Option<TopicId> {
-        let guard = self.inner.read().expect("topic interner read lock poisoned");
-        guard.map.get(key).copied()
+    pub(crate) fn resolve(&self, key: &str) -> Option<Arc<TopicEntry>> {
+        let guard = self
+            .inner
+            .read()
+            .expect("topic registry read lock poisoned");
+        let id = *guard.by_name.get(key)?;
+        guard.topics.get(id.index as usize).map(Arc::clone)
     }
 
-    /// Reverse lookup: return the topic string for a given `TopicId`.
-    ///
-    /// Allocates a new `String` on each call. Intended for debug and logging
-    /// paths only — do not call on hot paths.
-    pub fn name(&self, id: TopicId) -> Option<String> {
-        let guard = self.inner.read().expect("topic interner read lock poisoned");
-        guard.names.get(id.0 as usize).cloned()
+    pub(crate) fn get(&self, id: TopicId) -> Option<Arc<TopicEntry>> {
+        if id.broker != self.broker_id {
+            return None;
+        }
+        let guard = self
+            .inner
+            .read()
+            .expect("topic registry read lock poisoned");
+        guard.topics.get(id.index as usize).map(Arc::clone)
     }
-}
 
-impl Default for TopicInterner {
-    fn default() -> Self {
-        Self::new()
+    pub(crate) fn name(&self, id: TopicId) -> Option<String> {
+        self.get(id).map(|entry| entry.name().to_owned())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use super::*;
 
-    // --- TopicId ---
-
     #[test]
-    fn topic_id_copy_and_eq() {
-        let a = TopicId(0);
-        let b = a; // Copy
-        assert_eq!(a, b);
+    fn topic_id_carries_broker_identity() {
+        let a = TopicRegistry::new(4, 32);
+        let b = TopicRegistry::new(4, 32);
+
+        let a_id = a.get_or_create("topic").id();
+        let b_id = b.get_or_create("topic").id();
+
+        assert_ne!(a_id, b_id);
+        assert_ne!(a_id.broker(), b_id.broker());
     }
 
     #[test]
-    fn topic_id_hash_in_map() {
-        let mut m = HashMap::new();
-        m.insert(TopicId(1), "one");
-        assert_eq!(m[&TopicId(1)], "one");
-    }
-
-    // --- ExactTopic / TopicKey ---
-
-    #[test]
-    fn exact_topic_str_and_kind() {
-        let t = ExactTopic::new("sensor/temp");
-        assert_eq!(t.topic_str(), "sensor/temp");
-        assert_eq!(t.match_kind(), MatchKind::Exact);
+    fn topic_key_supports_exact_topics() {
+        let topic = ExactTopic::new("sensor/temp");
+        assert_eq!(topic.topic_str(), "sensor/temp");
+        assert_eq!(topic.match_kind(), MatchKind::Exact);
+        assert_eq!("sensor/temp".match_kind(), MatchKind::Exact);
     }
 
     #[test]
-    fn str_impl_of_topic_key() {
-        let s: &str = "sensor/temp";
-        assert_eq!(s.topic_str(), "sensor/temp");
-        assert_eq!(s.match_kind(), MatchKind::Exact);
-    }
+    fn registry_resolves_existing_topics_without_duplication() {
+        let registry = TopicRegistry::new(8, 64);
 
-    // --- TopicInterner ---
+        let first = registry.get_or_create("alpha");
+        let second = registry.get_or_create("alpha");
+        let by_name = registry.resolve("alpha").unwrap();
+        let by_id = registry.get(first.id()).unwrap();
 
-    fn interner() -> TopicInterner {
-        TopicInterner::new()
-    }
-
-    #[test]
-    fn default_interner_works() {
-        let ti = TopicInterner::default();
-        let id = ti.intern("x");
-        assert_eq!(ti.resolve("x"), Some(id));
+        assert_eq!(first.id(), second.id());
+        assert_eq!(first.id(), by_name.id());
+        assert_eq!(first.id(), by_id.id());
     }
 
     #[test]
-    fn intern_returns_stable_id() {
-        let ti = interner();
-        let id1 = ti.intern("foo");
-        let id2 = ti.intern("foo");
-        assert_eq!(id1, id2);
+    fn registry_rejects_foreign_topic_ids() {
+        let a = TopicRegistry::new(4, 32);
+        let b = TopicRegistry::new(4, 32);
+
+        let a_id = a.get_or_create("topic").id();
+        assert!(b.get(a_id).is_none());
+        assert!(b.name(a_id).is_none());
     }
 
     #[test]
-    fn intern_distinct_topics_get_distinct_ids() {
-        let ti = interner();
-        let a = ti.intern("a");
-        let b = ti.intern("b");
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn resolve_hit() {
-        let ti = interner();
-        let id = ti.intern("bar");
-        assert_eq!(ti.resolve("bar"), Some(id));
-    }
-
-    #[test]
-    fn resolve_miss_returns_none() {
-        let ti = interner();
-        assert_eq!(ti.resolve("nonexistent"), None);
-    }
-
-    #[test]
-    fn name_roundtrip() {
-        let ti = interner();
-        let id = ti.intern("my/topic");
-        assert_eq!(ti.name(id).as_deref(), Some("my/topic"));
-    }
-
-    #[test]
-    fn name_unknown_id_returns_none() {
-        let ti = interner();
-        assert_eq!(ti.name(TopicId(999)), None);
-    }
-
-    #[test]
-    fn intern_many_topics_are_sequential() {
-        let ti = interner();
-        for i in 0u32..16 {
-            let s = format!("topic/{i}");
-            let id = ti.intern(&s);
-            assert_eq!(id.0, i);
-        }
-    }
-
-    #[test]
-    fn concurrent_intern_is_consistent() {
-        use std::sync::Arc;
-        use std::thread;
-
-        let ti = Arc::new(interner());
+    fn concurrent_get_or_create_returns_same_id() {
+        let registry = Arc::new(TopicRegistry::new(4, 32));
         let handles: Vec<_> = (0..8)
             .map(|_| {
-                let ti = Arc::clone(&ti);
-                thread::spawn(move || ti.intern("shared"))
+                let registry = Arc::clone(&registry);
+                thread::spawn(move || registry.get_or_create("shared").id())
             })
             .collect();
 
         let ids: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        // All threads must get the same id.
-        assert!(ids.windows(2).all(|w| w[0] == w[1]));
+        assert!(ids.windows(2).all(|pair| pair[0] == pair[1]));
     }
 }
