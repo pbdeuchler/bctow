@@ -288,4 +288,29 @@ mod tests {
             assert!(consumer.join().unwrap() > 0);
         }
     }
+
+    #[derive(Copy, Clone, Debug, PartialEq)]
+    struct Point {
+        x: u32,
+        y: u32,
+    }
+
+    #[test]
+    fn generic_struct_roundtrips_through_ring() {
+        let ring = RingBuffer::<Point>::new(4);
+
+        let points = [
+            Point { x: 1, y: 2 },
+            Point { x: 10, y: 20 },
+            Point { x: 100, y: 200 },
+        ];
+
+        let seqs: Vec<u64> = points.iter().map(|p| ring.push(p)).collect();
+
+        for (i, seq) in seqs.iter().enumerate() {
+            let mut dst = MaybeUninit::<Point>::uninit();
+            ring.read_into(*seq, &mut dst).unwrap();
+            assert_eq!(unsafe { dst.assume_init() }, points[i]);
+        }
+    }
 }

@@ -6,6 +6,13 @@ use bctow::{
     Producer, TopicId,
 };
 
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct SensorReading {
+    sensor_id: u32,
+    value: f64,
+    timestamp: u64,
+}
+
 fn default_broker() -> (Producer<u64>, ConsumerContext<u64>) {
     broker::<u64>(BctowConfig::default())
 }
@@ -400,4 +407,39 @@ fn multithreaded_truly_concurrent_producer_and_consumers() {
         assert!(!values.is_empty());
         assert!(values.windows(2).all(|pair| pair[0] < pair[1]));
     }
+}
+
+#[test]
+fn custom_copy_struct_publish_and_receive() {
+    let (producer, ctx) = broker::<SensorReading>(BctowConfig::default());
+
+    let seed = SensorReading {
+        sensor_id: 0,
+        value: 0.0,
+        timestamp: 0,
+    };
+    producer.publish("sensors", &seed).unwrap();
+
+    let mut client = ctx.create_client();
+    client.subscribe("sensors").unwrap();
+
+    let readings = [
+        SensorReading { sensor_id: 1, value: 23.5, timestamp: 1000 },
+        SensorReading { sensor_id: 2, value: -7.1, timestamp: 2000 },
+        SensorReading { sensor_id: 1, value: 24.0, timestamp: 3000 },
+    ];
+
+    for r in &readings {
+        producer.publish("sensors", r).unwrap();
+    }
+
+    let received: Vec<SensorReading> = {
+        let mut out = Vec::new();
+        while let Some(msg) = client.poll() {
+            out.push(*msg.message);
+        }
+        out
+    };
+
+    assert_eq!(received, readings);
 }
