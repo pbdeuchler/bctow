@@ -1,5 +1,5 @@
 use bctow::{BctowConfig, ConsumerContext, FixedBytes, Producer, TopicId};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 // ---------------------------------------------------------------------------
 // Fixture types
@@ -9,22 +9,22 @@ use criterion::{criterion_group, criterion_main, Criterion};
 #[allow(dead_code)]
 #[derive(Copy, Clone)]
 struct MediumPayload {
-    f0: u64,
-    f1: u64,
-    f2: u64,
-    f3: u64,
-    f4: u64,
-    f5: u64,
-    f6: u64,
-    f7: u64,
-    f8: u64,
-    f9: u64,
-    f10: u64,
-    f11: u64,
-    f12: u64,
-    f13: u64,
-    f14: u64,
-    f15: u64,
+    timestamp: u64,
+    sensor_id: u64,
+    sequence: u64,
+    flags: u64,
+    value_0: u64,
+    value_1: u64,
+    value_2: u64,
+    value_3: u64,
+    value_4: u64,
+    value_5: u64,
+    value_6: u64,
+    value_7: u64,
+    value_8: u64,
+    value_9: u64,
+    value_10: u64,
+    value_11: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -34,22 +34,22 @@ struct MediumPayload {
 #[allow(dead_code)]
 fn make_medium_payload() -> MediumPayload {
     MediumPayload {
-        f0: 0,
-        f1: 1,
-        f2: 2,
-        f3: 3,
-        f4: 4,
-        f5: 5,
-        f6: 6,
-        f7: 7,
-        f8: 8,
-        f9: 9,
-        f10: 10,
-        f11: 11,
-        f12: 12,
-        f13: 13,
-        f14: 14,
-        f15: 15,
+        timestamp: 0,
+        sensor_id: 1,
+        sequence: 2,
+        flags: 3,
+        value_0: 4,
+        value_1: 5,
+        value_2: 6,
+        value_3: 7,
+        value_4: 8,
+        value_5: 9,
+        value_6: 10,
+        value_7: 11,
+        value_8: 12,
+        value_9: 13,
+        value_10: 14,
+        value_11: 15,
     }
 }
 
@@ -74,6 +74,7 @@ fn setup_broker_with_topics<T: Copy + Send + Sync + 'static>(
     (producer, ctx, topic_ids)
 }
 
+#[allow(dead_code)]
 fn spawn_consumers<T: Copy + Send + Sync + 'static>(
     ctx: &ConsumerContext<T>,
     topic_ids: &[TopicId],
@@ -103,7 +104,7 @@ fn bench_single_publish(c: &mut Criterion) {
     let topic_id = topics[0];
     c.bench_function("publish/single/u64", |b| {
         b.iter(|| {
-            producer.publish_id(topic_id, &42u64).unwrap();
+            black_box(producer.publish_id(topic_id, black_box(&42u64)).unwrap());
         });
     });
 }
