@@ -44,6 +44,12 @@ bctow: generic typed pub/sub ring buffer library (Rust)
 ## Features
 - metrics: adds AtomicU64 counters on BrokerInner, exposes Metrics via ConsumerContext::metrics()
 
+## Benchmarks
+- benches/pubsub.rs: criterion benchmarks (harness=false, `cargo bench --all-features`)
+- Groups: publish_throughput (u64/MediumPayload/FixedBytes<256>/FixedBytes<4096>), consumer_scaling (1-16), topic_scaling (1-64), pathological (tiny ring, 256-topic fan-out, subscribe churn, SkipToLatest overflow), publish_path (by_id vs by_name)
+- Helpers: setup_broker_with_topics<T>, spawn_consumers<T>, MediumPayload (128B Copy struct), make_fixed_bytes<N>
+- CI: Bencher (bencher.dev) tracks regressions via .github/workflows/{base,pr,fork_pr}_benchmarks*.yml
+
 ## Files
 - src/ring.rs: Slot<T>, RingBuffer<T>, Cursor
 - src/topic.rs: TopicId, TopicKey trait, ExactTopic, TopicEntry<T>, TopicRegistry<T>
@@ -53,5 +59,9 @@ bctow: generic typed pub/sub ring buffer library (Rust)
 - src/producer.rs: Producer<T>
 - src/consumer.rs: ConsumerContext<T>, ConsumerClient<T>, ReceivedMessage<'a,T>, try_read_with_policy
 - src/lib.rs: pub broker<T>() fn, re-exports
+- benches/pubsub.rs: criterion benchmark suite (5 groups, fixture types, setup helpers)
 - tests/integration.rs: most tests use u64; SensorReading (Copy struct) and FixedBytes<64> also covered
 - examples/basic.rs: broker::<SensorReading> demo
+- .github/workflows/base_benchmarks.yml: Bencher tracking on main
+- .github/workflows/pr_benchmarks.yml: PR benchmarks + fork PR artifact caching
+- .github/workflows/fork_pr_benchmarks_track.yml: fork PR Bencher upload

@@ -61,6 +61,32 @@ let (producer, ctx) = broker::<FixedBytes<64>>(BctowConfig::default());
 producer.publish("events/raw", &FixedBytes::<64>::new(b"hello").unwrap()).unwrap();
 ```
 
+## Benchmarks
+
+Criterion benchmarks live in `benches/pubsub.rs`. Run them with:
+
+```bash
+cargo bench --all-features
+```
+
+Run a specific group:
+
+```bash
+cargo bench --all-features -- publish_throughput
+```
+
+Benchmark groups:
+
+| Group | What it measures |
+|-------|-----------------|
+| `publish_throughput` | Publish latency across message sizes (8B to 4096B) |
+| `consumer_scaling` | Publish+poll with 1/2/4/8/16 consumers |
+| `topic_scaling` | Round-robin publish+poll across 1/4/16/64 topics |
+| `pathological` | Tiny ring overflow, 256-topic fan-out, subscribe churn, SkipToLatest overflow |
+| `publish_path` | `publish_id` (cached ring) vs `publish` (string lookup) |
+
+CI uses [Bencher](https://bencher.dev) to track regressions on PRs. Requires a `BENCHER_API_TOKEN` repository secret.
+
 ## Optional feature
 
 - `metrics`: exposes `ConsumerContext::metrics()` with relaxed-atomic counters.
