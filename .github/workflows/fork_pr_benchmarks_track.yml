@@ -1,0 +1,36 @@
+name: Fork PR Benchmarks (Track)
+
+on:
+  workflow_run:
+    workflows: ["PR Benchmarks"]
+    types: [completed]
+
+jobs:
+  track:
+    name: Track Fork PR Benchmarks
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name != github.repository
+    runs-on: ubuntu-latest
+    env:
+      BENCHER_PROJECT: bctow
+      BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: benchmark-results
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+      - uses: bencherdev/bencher@main
+      - name: Track benchmark results
+        run: |
+          bencher run \
+            --adapter rust_criterion \
+            --branch "${{ github.event.workflow_run.head_branch }}" \
+            --testbed ubuntu-latest \
+            --start-point main \
+            --start-point-clone-thresholds \
+            --github-actions "${{ secrets.GITHUB_TOKEN }}" \
+            --err \
+            --file benchmark-results.txt
