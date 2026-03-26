@@ -85,7 +85,7 @@ Benchmark groups:
 | `pathological` | Tiny ring overflow, 256-topic fan-out, subscribe churn, SkipToLatest overflow |
 | `publish_path` | `publish_id` (cached ring) vs `publish` (string lookup) |
 
-CI uses [Bencher](https://bencher.dev) to track regressions on PRs. Requires a `BENCHER_API_TOKEN` repository secret.
+CI uses [Bencher](https://bencher.dev) to track the main branch baseline and detect regressions on PRs. Requires a `BENCHER_API_TOKEN` repository secret.
 
 ## Optional feature
 
