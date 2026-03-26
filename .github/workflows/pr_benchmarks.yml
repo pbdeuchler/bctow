@@ -2,7 +2,7 @@ name: PR Benchmarks
 
 on:
   pull_request:
-    types: [opened, reopened, edited, synchronize]
+    types: [opened, reopened, synchronize]
 
 jobs:
   benchmark:
@@ -35,9 +35,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Build benchmarks
+        run: cargo bench --all-features --no-run
       - name: Run benchmarks
-        run: cargo bench --all-features 2>&1 | tee benchmark-results.txt
+        run: cargo bench --all-features 2>/dev/null | tee benchmark-results.txt
+      - name: Save PR metadata
+        run: |
+          echo "${{ github.event.pull_request.base.ref }}" > pr-base-ref.txt
+          echo "${{ github.event.pull_request.number }}" > pr-number.txt
       - uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
-          path: benchmark-results.txt
+          path: |
+            benchmark-results.txt
+            pr-base-ref.txt
+            pr-number.txt

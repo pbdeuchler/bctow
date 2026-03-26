@@ -23,13 +23,18 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           run-id: ${{ github.event.workflow_run.id }}
       - uses: bencherdev/bencher@main
+      - name: Read PR metadata
+        id: meta
+        run: |
+          echo "base_ref=$(cat pr-base-ref.txt)" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$(cat pr-number.txt)" >> "$GITHUB_OUTPUT"
       - name: Track benchmark results
         run: |
           bencher run \
             --adapter rust_criterion \
-            --branch "${{ github.event.workflow_run.head_branch }}" \
+            --branch "fork-pr-${{ steps.meta.outputs.pr_number }}" \
             --testbed ubuntu-latest \
-            --start-point main \
+            --start-point "${{ steps.meta.outputs.base_ref }}" \
             --start-point-clone-thresholds \
             --github-actions "${{ secrets.GITHUB_TOKEN }}" \
             --err \
