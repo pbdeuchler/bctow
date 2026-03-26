@@ -38,7 +38,7 @@ jobs:
       - name: Build benchmarks
         run: cargo bench --all-features --no-run
       - name: Run benchmarks
-        run: cargo bench --all-features 2>/dev/null | tee benchmark-results.txt
+        run: cargo bench --all-features 2>benchmark-stderr.txt | tee benchmark-results.txt
       - name: Save PR metadata
         run: |
           echo "${{ github.event.pull_request.base.ref }}" > pr-base-ref.txt
@@ -48,5 +48,6 @@ jobs:
           name: benchmark-results
           path: |
             benchmark-results.txt
+            benchmark-stderr.txt
             pr-base-ref.txt
             pr-number.txt
