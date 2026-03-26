@@ -242,12 +242,12 @@ fn bench_pathological(c: &mut Criterion) {
             for &tid in &topics {
                 black_box(producer.publish_id(tid, black_box(&42u64)).unwrap());
             }
-            // Drain all available messages
-            while client.poll().is_some() {}
+            while black_box(client.poll()).is_some() {}
         });
     });
 
-    // Subscribe/unsubscribe churn: repeated sub/unsub cycle
+    // Subscribe/unsubscribe churn: measures pure sub/unsub overhead.
+    // poll() returns None because Cursor::new_latest positions past existing data.
     group.bench_function("subscribe_churn", |b| {
         let config = BctowConfig { ring_buffer_capacity: 64, ..Default::default() };
         let (producer, ctx, topics) = setup_broker_with_topics::<u64>(config, 8);
@@ -268,23 +268,26 @@ fn bench_pathological(c: &mut Criterion) {
         });
     });
 
-    // SkipToLatest overflow: consumer always jumps ahead
+    // SkipToLatest overflow: consumer re-creates lag every iteration
+    // Publishes capacity+1 messages so the consumer's cursor is always behind
+    // oldest_available_seq, forcing the SkipToLatest policy path on every poll.
     group.bench_function("skip_to_latest_overflow", |b| {
+        let cap = 4usize;
         let config = BctowConfig {
-            ring_buffer_capacity: 4,
+            ring_buffer_capacity: cap,
             overflow_policy: OverflowPolicy::SkipToLatest,
         };
         let (producer, ctx, topics) = setup_broker_with_topics::<u64>(config, 1);
         let tid = topics[0];
         let mut clients = spawn_consumers(&ctx, &topics, 1);
         let client = &mut clients[0];
-        // Fill the ring well past capacity so consumer is lagging
-        for i in 0..100u64 {
-            producer.publish_id(tid, &i).unwrap();
-        }
 
         b.iter(|| {
-            black_box(producer.publish_id(tid, black_box(&999u64)).unwrap());
+            // Push enough to guarantee the consumer is behind oldest_available_seq
+            for i in 0..(cap as u64 + 1) {
+                producer.publish_id(tid, black_box(&i)).unwrap();
+            }
+            // Poll triggers SkipToLatest → cursor jumps to latest+1, returns None
             black_box(client.poll());
         });
     });
