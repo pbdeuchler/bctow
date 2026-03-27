@@ -458,16 +458,246 @@ fn scaling_benchmarks() {
     combined_scaling();
 }
 
+// ── Stress Benchmarks ────────────────────────────────────────────────────────
+
+/// Power-of-2 consumer sweep on a single topic. Each consumer gets its own
+/// thread (no multiplexing) so that readers-atomic contention is maximal.
+/// Measures publish-side latency to locate the exact cliff where the
+/// ring.push() spin-wait on `readers == 0` inflates from ns to µs.
+fn contention_cliff() {
+    let consumer_counts: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
+    let message_count = 500u64;
+
+    for &consumers in consumer_counts {
+        let config = bctow::BctowConfig {
+            ring_buffer_capacity: 1024,
+            overflow_policy: bctow::OverflowPolicy::DropOldest,
+        };
+        let (producer, ctx) = bctow::broker::<bctow::FixedBytes<512>>(config);
+        let topic_id = producer.register_topic("topic/0");
+        let val = harness::fill_fixed_bytes::<512>();
+
+        // Thread-per-consumer: pass `consumers` as both count and thread limit.
+        let handle = harness::spawn_consumers(&ctx, &[topic_id], consumers, consumers, message_count);
+
+        // Release consumers first, then time publish to capture the spin-wait cost.
+        handle.release();
+        let publish_start = std::time::Instant::now();
+        for _ in 0..message_count {
+            producer.publish_id(topic_id, &val).unwrap();
+        }
+        let publish_elapsed = publish_start.elapsed();
+
+        let completed = handle.wait(std::time::Duration::from_secs(60));
+        let total_elapsed = publish_elapsed; // we report publish-side timing
+
+        let publish_ns = publish_elapsed.as_nanos() as f64;
+        let publish_ns_per_msg = publish_ns / message_count as f64;
+        let throughput = message_count as f64 / (publish_ns / 1_000_000_000.0);
+
+        println!(
+            "[stress/contention_cliff] consumers={consumers} threads={} messages={message_count} publish_latency_ns_per_msg={publish_ns_per_msg:.0} throughput_msg_sec={throughput:.0} elapsed_ms={:.2} completed={completed}",
+            consumers.min(harness::thread_ceiling()),
+            total_elapsed.as_secs_f64() * 1000.0,
+        );
+    }
+}
+
+/// Single consumer subscribed to 10K topics, but messages land on only one.
+/// Surfaces the O(subscriptions) round-robin scan cost per successful poll().
+fn sparse_poll() {
+    let topic_count = 10_000usize;
+    let message_count = 100u64;
+
+    let config = bctow::BctowConfig {
+        ring_buffer_capacity: 128,
+        overflow_policy: bctow::OverflowPolicy::DropOldest,
+    };
+    let (producer, ctx) = bctow::broker::<bctow::FixedBytes<512>>(config);
+
+    let topic_ids: Vec<bctow::TopicId> = (0..topic_count)
+        .map(|i| producer.register_topic(format!("topic/{i}")))
+        .collect();
+
+    let mut client = ctx.create_client();
+    for &id in &topic_ids {
+        client.subscribe_id(id).unwrap();
+    }
+
+    // Only publish to topic 0 — all other 9999 subscriptions are dead weight
+    // that poll() must iterate past on every round-robin cycle.
+    for _ in 0..message_count {
+        producer.publish_id(topic_ids[0], &harness::fill_fixed_bytes::<512>()).unwrap();
+    }
+
+    let mut received = 0u64;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let start = std::time::Instant::now();
+    loop {
+        if received >= message_count {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        if let Some(msg) = client.poll() {
+            std::hint::black_box(msg);
+            received += 1;
+        }
+    }
+    let elapsed = start.elapsed();
+
+    let elapsed_ns = elapsed.as_nanos() as f64;
+    let throughput = received as f64 / (elapsed_ns / 1_000_000_000.0);
+    let latency_ns = if received > 0 { elapsed_ns / received as f64 } else { 0.0 };
+
+    println!(
+        "[stress/sparse_poll] topics={topic_count} active_topics=1 messages={message_count} throughput_msg_sec={throughput:.0} latency_ns_per_msg={latency_ns:.0} elapsed_ms={:.2} note=O(subscriptions)_scan_per_poll",
+        elapsed.as_secs_f64() * 1000.0,
+    );
+}
+
+/// Compare DropOldest / DropNewest / SkipToLatest at 2x overproduce rate.
+/// Consumers poll with a deliberate 100µs sleep so the ring fills and the
+/// overflow policy engages. Reports received vs published to quantify drops.
+fn overflow_policy_comparison() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    let policies = [
+        bctow::OverflowPolicy::DropOldest,
+        bctow::OverflowPolicy::DropNewest,
+        bctow::OverflowPolicy::SkipToLatest,
+    ];
+    let ring_capacity = 32usize;
+    let consumer_count = 100usize;
+    let published = 500u64;
+
+    for policy in policies {
+        let config = bctow::BctowConfig {
+            ring_buffer_capacity: ring_capacity,
+            overflow_policy: policy,
+        };
+        let (producer, ctx) = bctow::broker::<bctow::FixedBytes<512>>(config);
+        let topic_id = producer.register_topic("topic/0");
+        let val = harness::fill_fixed_bytes::<512>();
+
+        // +1 for the main thread which acts as the release signal
+        let barrier = Arc::new(Barrier::new(consumer_count + 1));
+        let received_total = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let mut handles = Vec::with_capacity(consumer_count);
+        for _ in 0..consumer_count {
+            let mut client = ctx.create_client();
+            client.subscribe_id(topic_id).unwrap();
+
+            let b = Arc::clone(&barrier);
+            let counter = Arc::clone(&received_total);
+            let stop_flag = Arc::clone(&stop);
+
+            let h = std::thread::spawn(move || {
+                b.wait();
+                while !stop_flag.load(Ordering::Acquire) {
+                    if let Some(msg) = client.poll() {
+                        std::hint::black_box(msg);
+                        counter.fetch_add(1, Ordering::AcqRel);
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_micros(100));
+                    }
+                }
+            });
+            handles.push(h);
+        }
+
+        // Release all consumers, then publish as fast as possible.
+        barrier.wait();
+        let start = std::time::Instant::now();
+        for _ in 0..published {
+            // Best-effort: ignore errors (DropNewest returns Err on full ring)
+            let _ = producer.publish_id(topic_id, &val);
+        }
+
+        // Give consumers up to 2s to drain whatever landed in the ring.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            std::hint::spin_loop();
+        }
+        stop.store(true, Ordering::Release);
+        for h in handles {
+            let _ = h.join();
+        }
+        let elapsed = start.elapsed();
+
+        let total_received = received_total.load(Ordering::Acquire);
+        let avg_per_consumer = total_received as f64 / consumer_count as f64;
+        let policy_name = match policy {
+            bctow::OverflowPolicy::DropOldest => "DropOldest",
+            bctow::OverflowPolicy::DropNewest => "DropNewest",
+            bctow::OverflowPolicy::SkipToLatest => "SkipToLatest",
+        };
+
+        println!(
+            "[stress/overflow_policy_comparison] policy={policy_name} capacity={ring_capacity} consumers={consumer_count} published={published} received_total={total_received} avg_received_per_consumer={avg_per_consumer:.1} elapsed_ms={:.2}",
+            elapsed.as_secs_f64() * 1000.0,
+        );
+    }
+}
+
+/// Fanout benchmark with 4KB messages to surface memory-bandwidth ceiling.
+/// At 500 consumers × 4KB, each publish drives ~2MB of DRAM reads.
+fn large_message_fanout() {
+    let consumer_counts: &[usize] = &[10, 50, 100, 500];
+    let message_count = 100u64;
+
+    for &consumers in consumer_counts {
+        let (producer, ctx, topic_ids) =
+            harness::setup_broker::<bctow::FixedBytes<4096>>(1, 1024);
+        let topic_id = topic_ids[0];
+        let val = harness::fill_fixed_bytes::<4096>();
+
+        let handle = harness::spawn_consumers(&ctx, &topic_ids, consumers, consumers, message_count);
+
+        for _ in 0..message_count {
+            producer.publish_id(topic_id, &val).unwrap();
+        }
+
+        handle.release();
+        let start = std::time::Instant::now();
+        let completed = handle.wait(std::time::Duration::from_secs(60));
+        let elapsed = start.elapsed();
+
+        let total_deliveries = (consumers as u64) * message_count;
+        let elapsed_ns = elapsed.as_nanos() as f64;
+        let throughput = total_deliveries as f64 / (elapsed_ns / 1_000_000_000.0);
+        let latency_ns = elapsed_ns / total_deliveries as f64;
+
+        println!(
+            "[stress/large_message_fanout] consumers={consumers} message_size=4096 messages={message_count} throughput_msg_sec={throughput:.0} latency_ns_per_msg={latency_ns:.0} elapsed_ms={:.2} completed={completed}",
+            elapsed.as_secs_f64() * 1000.0,
+        );
+    }
+}
+
+fn stress_benchmarks() {
+    println!("\n=== Stress Benchmarks ===\n");
+    contention_cliff();
+    sparse_poll();
+    overflow_policy_comparison();
+    large_message_fanout();
+}
+
 fn main() {
-    // Run scaling benchmarks only when no Criterion filter is passed, or when
-    // the filter explicitly matches "scaling". This avoids adding seconds of
-    // overhead when iterating on Criterion-only groups like `-- operations`.
     let args: Vec<String> = std::env::args().collect();
     let has_filter = args.iter().any(|a| a == "--bench" || a == "--test")
         || args.iter().skip(1).any(|a| !a.starts_with('-'));
     let filter_matches_scaling = args.iter().any(|a| a.contains("scaling"));
+    let filter_matches_stress = args.iter().any(|a| a.contains("stress"));
     if !has_filter || filter_matches_scaling {
         scaling_benchmarks();
+    }
+    if !has_filter || filter_matches_stress {
+        stress_benchmarks();
     }
     benches();
 }
