@@ -211,6 +211,9 @@ mod harness {
     }
 }
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
+
 use criterion::{black_box, criterion_group, Criterion};
 
 fn operations_benchmark(c: &mut Criterion) {
@@ -489,16 +492,20 @@ fn contention_cliff() {
         let publish_elapsed = publish_start.elapsed();
 
         let completed = handle.wait(std::time::Duration::from_secs(60));
-        let total_elapsed = publish_elapsed; // we report publish-side timing
 
         let publish_ns = publish_elapsed.as_nanos() as f64;
         let publish_ns_per_msg = publish_ns / message_count as f64;
         let throughput = message_count as f64 / (publish_ns / 1_000_000_000.0);
 
+        let actual_threads = consumers.min(harness::thread_ceiling());
+        if actual_threads < consumers {
+            println!(
+                "  WARNING: contention_cliff consumers={consumers} exceeds thread_ceiling={actual_threads}, results reflect multiplexed contention"
+            );
+        }
         println!(
-            "[stress/contention_cliff] consumers={consumers} threads={} messages={message_count} publish_latency_ns_per_msg={publish_ns_per_msg:.0} throughput_msg_sec={throughput:.0} elapsed_ms={:.2} completed={completed}",
-            consumers.min(harness::thread_ceiling()),
-            total_elapsed.as_secs_f64() * 1000.0,
+            "[stress/contention_cliff] consumers={consumers} threads={actual_threads} messages={message_count} publish_latency_ns_per_msg={publish_ns_per_msg:.0} throughput_msg_sec={throughput:.0} elapsed_ms={:.2} completed={completed}",
+            publish_elapsed.as_secs_f64() * 1000.0,
         );
     }
 }
@@ -526,8 +533,9 @@ fn sparse_poll() {
 
     // Only publish to topic 0 — all other 9999 subscriptions are dead weight
     // that poll() must iterate past on every round-robin cycle.
+    let val = harness::fill_fixed_bytes::<512>();
     for _ in 0..message_count {
-        producer.publish_id(topic_ids[0], &harness::fill_fixed_bytes::<512>()).unwrap();
+        producer.publish_id(topic_ids[0], &val).unwrap();
     }
 
     let mut received = 0u64;
@@ -561,9 +569,6 @@ fn sparse_poll() {
 /// Consumers poll with a deliberate 100µs sleep so the ring fills and the
 /// overflow policy engages. Reports received vs published to quantify drops.
 fn overflow_policy_comparison() {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::{Arc, Barrier};
-
     let policies = [
         bctow::OverflowPolicy::DropOldest,
         bctow::OverflowPolicy::DropNewest,
@@ -602,9 +607,10 @@ fn overflow_policy_comparison() {
                     if let Some(msg) = client.poll() {
                         std::hint::black_box(msg);
                         counter.fetch_add(1, Ordering::AcqRel);
-                    } else {
-                        std::thread::sleep(std::time::Duration::from_micros(100));
                     }
+                    // Sleep after every poll (hit or miss) to ensure the producer
+                    // outpaces consumers and the overflow policy engages.
+                    std::thread::sleep(std::time::Duration::from_micros(100));
                 }
             });
             handles.push(h);
@@ -614,15 +620,13 @@ fn overflow_policy_comparison() {
         barrier.wait();
         let start = std::time::Instant::now();
         for _ in 0..published {
-            // Best-effort: ignore errors (DropNewest returns Err on full ring)
+            // Result is always Ok(seq) — overflow is handled on the consumer side
+            // via try_read_with_policy, not on the producer side.
             let _ = producer.publish_id(topic_id, &val);
         }
 
-        // Give consumers up to 2s to drain whatever landed in the ring.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while std::time::Instant::now() < deadline {
-            std::hint::spin_loop();
-        }
+        // Yield the main thread so consumer threads get CPU time to drain.
+        std::thread::sleep(std::time::Duration::from_secs(2));
         stop.store(true, Ordering::Release);
         for h in handles {
             let _ = h.join();
