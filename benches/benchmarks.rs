@@ -211,6 +211,114 @@ mod harness {
     }
 }
 
-fn main() {
-    // Placeholder — replaced by criterion_main!() in Step 2
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+
+fn operations_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("operations");
+
+    // publish_id_warm: idealized hot path — no lock, no string lookup.
+    group.bench_function("publish_id_warm", |b| {
+        let (producer, _ctx, topic_ids) = harness::setup_broker::<u64>(1, 1024);
+        let topic_id = topic_ids[0];
+        // Warm the producer's ring cache with one publish before measuring.
+        producer.publish_id(topic_id, &0u64).unwrap();
+        b.iter(|| {
+            producer.publish_id(black_box(topic_id), black_box(&42u64)).unwrap();
+        });
+    });
+
+    // publish_string_lookup: same publish path but via string name.
+    // Delta vs publish_id_warm isolates RwLock read + HashMap lookup cost.
+    group.bench_function("publish_string_lookup", |b| {
+        let (producer, _ctx, _topic_ids) = harness::setup_broker::<u64>(1, 1024);
+        // Warm with one publish so the ring cache entry exists.
+        producer.publish("topic/0", &0u64).unwrap();
+        b.iter(|| {
+            producer.publish(black_box("topic/0"), black_box(&42u64)).unwrap();
+        });
+    });
+
+    // poll_hit: publish one message then poll it. Round-trip cost.
+    // Delta between this and publish_id_warm isolates the poll (read_into + copy) cost.
+    group.bench_function("poll_hit", |b| {
+        let (producer, ctx, topic_ids) = harness::setup_broker::<u64>(1, 1024);
+        let topic_id = topic_ids[0];
+        let mut client = ctx.create_client();
+        client.subscribe_id(topic_id).unwrap();
+        b.iter(|| {
+            producer.publish_id(topic_id, &42u64).unwrap();
+            black_box(client.poll());
+        });
+    });
+
+    // poll_miss: consumer subscribed, no messages pending. Measures scan overhead baseline.
+    group.bench_function("poll_miss", |b| {
+        let (_producer, ctx, topic_ids) = harness::setup_broker::<u64>(1, 1024);
+        let topic_id = topic_ids[0];
+        let mut client = ctx.create_client();
+        client.subscribe_id(topic_id).unwrap();
+        b.iter(|| {
+            black_box(client.poll());
+        });
+    });
+
+    group.finish();
 }
+
+fn message_size_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("message_size");
+
+    group.bench_function("u64", |b| {
+        let (producer, ctx, topic_ids) = harness::setup_broker::<u64>(1, 1024);
+        let topic_id = topic_ids[0];
+        let mut client = ctx.create_client();
+        client.subscribe_id(topic_id).unwrap();
+        let val: u64 = 42;
+        b.iter(|| {
+            producer.publish_id(topic_id, black_box(&val)).unwrap();
+            black_box(client.poll());
+        });
+    });
+
+    group.bench_function("fixed_bytes_64", |b| {
+        let (producer, ctx, topic_ids) = harness::setup_broker::<bctow::FixedBytes<64>>(1, 1024);
+        let topic_id = topic_ids[0];
+        let mut client = ctx.create_client();
+        client.subscribe_id(topic_id).unwrap();
+        let val = harness::fill_fixed_bytes::<64>();
+        b.iter(|| {
+            producer.publish_id(topic_id, black_box(&val)).unwrap();
+            black_box(client.poll());
+        });
+    });
+
+    group.bench_function("fixed_bytes_512", |b| {
+        let (producer, ctx, topic_ids) = harness::setup_broker::<bctow::FixedBytes<512>>(1, 1024);
+        let topic_id = topic_ids[0];
+        let mut client = ctx.create_client();
+        client.subscribe_id(topic_id).unwrap();
+        let val = harness::fill_fixed_bytes::<512>();
+        b.iter(|| {
+            producer.publish_id(topic_id, black_box(&val)).unwrap();
+            black_box(client.poll());
+        });
+    });
+
+    group.bench_function("fixed_bytes_4096", |b| {
+        let (producer, ctx, topic_ids) =
+            harness::setup_broker::<bctow::FixedBytes<4096>>(1, 1024);
+        let topic_id = topic_ids[0];
+        let mut client = ctx.create_client();
+        client.subscribe_id(topic_id).unwrap();
+        let val = harness::fill_fixed_bytes::<4096>();
+        b.iter(|| {
+            producer.publish_id(topic_id, black_box(&val)).unwrap();
+            black_box(client.poll());
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, operations_benchmark, message_size_benchmark);
+criterion_main!(benches);

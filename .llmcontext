@@ -55,3 +55,4 @@ bctow: generic typed pub/sub ring buffer library (Rust)
 - src/lib.rs: pub broker<T>() fn, re-exports
 - tests/integration.rs: most tests use u64; SensorReading (Copy struct) and FixedBytes<64> also covered
 - examples/basic.rs: broker::<SensorReading> demo
+- benches/benchmarks.rs: Criterion benchmarks (harness=false); mod harness has setup_broker/spawn_consumers/fill_fixed_bytes helpers; criterion groups: operations (publish_id_warm, publish_string_lookup, poll_hit, poll_miss) and message_size (u64, fixed_bytes_64/512/4096 round-trips)
