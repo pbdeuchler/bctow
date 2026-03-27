@@ -568,6 +568,10 @@ fn sparse_poll() {
 /// Compare DropOldest / DropNewest / SkipToLatest at 2x overproduce rate.
 /// Consumers poll with a deliberate 100µs sleep so the ring fills and the
 /// overflow policy engages. Reports received vs published to quantify drops.
+///
+/// This benchmark cannot use `spawn_consumers`/`drain_loop` because those
+/// poll at full speed. We need per-poll sleep to ensure the producer outpaces
+/// consumers and the overflow policy actually engages.
 fn overflow_policy_comparison() {
     let policies = [
         bctow::OverflowPolicy::DropOldest,
@@ -618,12 +622,13 @@ fn overflow_policy_comparison() {
 
         // Release all consumers, then publish as fast as possible.
         barrier.wait();
-        let start = std::time::Instant::now();
+        let publish_start = std::time::Instant::now();
         for _ in 0..published {
             // Result is always Ok(seq) — overflow is handled on the consumer side
             // via try_read_with_policy, not on the producer side.
             let _ = producer.publish_id(topic_id, &val);
         }
+        let publish_elapsed = publish_start.elapsed();
 
         // Yield the main thread so consumer threads get CPU time to drain.
         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -631,7 +636,6 @@ fn overflow_policy_comparison() {
         for h in handles {
             let _ = h.join();
         }
-        let elapsed = start.elapsed();
 
         let total_received = received_total.load(Ordering::Acquire);
         let avg_per_consumer = total_received as f64 / consumer_count as f64;
@@ -642,8 +646,8 @@ fn overflow_policy_comparison() {
         };
 
         println!(
-            "[stress/overflow_policy_comparison] policy={policy_name} capacity={ring_capacity} consumers={consumer_count} published={published} received_total={total_received} avg_received_per_consumer={avg_per_consumer:.1} elapsed_ms={:.2}",
-            elapsed.as_secs_f64() * 1000.0,
+            "[stress/overflow_policy_comparison] policy={policy_name} capacity={ring_capacity} consumers={consumer_count} published={published} received_total={total_received} avg_received_per_consumer={avg_per_consumer:.1} publish_ms={:.2}",
+            publish_elapsed.as_secs_f64() * 1000.0,
         );
     }
 }
@@ -692,15 +696,21 @@ fn stress_benchmarks() {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let has_filter = args.iter().any(|a| a == "--bench" || a == "--test")
-        || args.iter().skip(1).any(|a| !a.starts_with('-'));
-    let filter_matches_scaling = args.iter().any(|a| a.contains("scaling"));
-    let filter_matches_stress = args.iter().any(|a| a.contains("stress"));
-    if !has_filter || filter_matches_scaling {
+    // Criterion passes positional filter args after `--`. Detect whether the
+    // user supplied a filter so we can skip custom benchmarks when they only
+    // target a Criterion group (e.g., `-- operations`). Note: cargo always
+    // injects `--bench`, so we must ignore flags when detecting a user filter.
+    let positional_filter: Option<String> = std::env::args()
+        .skip(1)
+        .find(|a| !a.starts_with('-'));
+
+    let run_scaling = positional_filter.as_ref().map_or(true, |f| f.contains("scaling"));
+    let run_stress = positional_filter.as_ref().map_or(true, |f| f.contains("stress"));
+
+    if run_scaling {
         scaling_benchmarks();
     }
-    if !has_filter || filter_matches_stress {
+    if run_stress {
         stress_benchmarks();
     }
     benches();

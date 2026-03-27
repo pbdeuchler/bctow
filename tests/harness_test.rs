@@ -93,6 +93,91 @@ fn drain_loop<T: Copy + Send + Sync + 'static>(
     }
 }
 
+struct ConsumerHandle {
+    barrier: Arc<Barrier>,
+    done: Arc<AtomicU64>,
+    thread_count: u64,
+    stop: Arc<AtomicBool>,
+    threads: Vec<thread::JoinHandle<()>>,
+}
+
+impl ConsumerHandle {
+    fn release(&self) {
+        self.barrier.wait();
+    }
+
+    fn wait(mut self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while self.done.load(Ordering::Acquire) < self.thread_count {
+            if std::time::Instant::now() >= deadline {
+                self.stop.store(true, Ordering::Release);
+                return false;
+            }
+            std::hint::spin_loop();
+        }
+        for h in self.threads.drain(..) {
+            let _ = h.join();
+        }
+        true
+    }
+}
+
+fn spawn_consumers<T: Copy + Send + Sync + 'static>(
+    ctx: &ConsumerContext<T>,
+    topic_ids: &[TopicId],
+    count: usize,
+    threads: usize,
+    messages_per_consumer: u64,
+) -> ConsumerHandle {
+    let ceiling = thread_ceiling();
+    let actual_threads = count.min(threads).min(ceiling);
+
+    let barrier = Arc::new(Barrier::new(actual_threads + 1));
+    let done = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let total_messages = (count as u64) * messages_per_consumer;
+
+    let mut all_clients: Vec<bctow::ConsumerClient<T>> = (0..count)
+        .map(|_| {
+            let mut client = ctx.create_client();
+            for &id in topic_ids {
+                client.subscribe_id(id).expect("subscribe_id failed");
+            }
+            client
+        })
+        .collect();
+
+    let clients_per_thread = count / actual_threads;
+    let remainder = count % actual_threads;
+    let mut thread_handles = Vec::with_capacity(actual_threads);
+    let counter = Arc::new(AtomicU64::new(0));
+
+    for t in 0..actual_threads {
+        let extra = if t < remainder { 1 } else { 0 };
+        let batch_size = clients_per_thread + extra;
+        let batch: Vec<bctow::ConsumerClient<T>> = all_clients.drain(..batch_size).collect();
+
+        let b = Arc::clone(&barrier);
+        let ctr = Arc::clone(&counter);
+        let done_flag = Arc::clone(&done);
+        let stop_flag = Arc::clone(&stop);
+
+        let handle = thread::spawn(move || {
+            drain_loop(batch, b, total_messages, ctr, stop_flag);
+            done_flag.fetch_add(1, Ordering::Release);
+        });
+        thread_handles.push(handle);
+    }
+
+    ConsumerHandle {
+        barrier,
+        done,
+        thread_count: actual_threads as u64,
+        stop,
+        threads: thread_handles,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -158,13 +243,22 @@ fn drain_loop_exits_when_counter_reaches_expected() {
     let b = Arc::clone(&barrier);
     let ctr = Arc::clone(&counter);
     let stp = Arc::clone(&stop);
+    let stop_watchdog = Arc::clone(&stop);
 
     let handle = thread::spawn(move || {
         drain_loop(vec![client], b, 3, ctr, stp);
     });
 
     barrier.wait(); // release the drain loop
+
+    // Watchdog: set stop flag after 5s so test fails fast instead of hanging.
+    let watchdog = thread::spawn(move || {
+        thread::sleep(Duration::from_secs(5));
+        stop_watchdog.store(true, Ordering::Release);
+    });
+
     handle.join().expect("drain thread panicked");
+    let _ = watchdog.join();
 
     assert_eq!(counter.load(Ordering::Acquire), 3);
 }
@@ -201,4 +295,41 @@ fn drain_loop_exits_when_stop_flag_set() {
     handle
         .join()
         .expect("drain thread should have exited after stop flag");
+}
+
+#[test]
+fn spawn_consumers_distributes_clients_and_drains_messages() {
+    let (producer, ctx, topic_ids) = setup_broker::<u64>(1, 1024);
+    let topic_id = topic_ids[0];
+
+    // 4 consumers across 2 threads, 10 messages each
+    let handle = spawn_consumers(&ctx, &topic_ids, 4, 2, 10);
+
+    // Publish 10 messages; each of the 4 consumers sees all 10 → 40 total.
+    for i in 0u64..10 {
+        producer.publish_id(topic_id, &i).unwrap();
+    }
+
+    handle.release();
+    let completed = handle.wait(Duration::from_secs(10));
+    assert!(completed, "spawn_consumers should drain 40 messages within timeout");
+}
+
+#[test]
+fn spawn_consumers_handles_more_consumers_than_threads() {
+    let (producer, ctx, topic_ids) = setup_broker::<u64>(2, 1024);
+
+    // 6 consumers across 3 threads, 5 messages per consumer per topic (10 total per consumer)
+    let handle = spawn_consumers(&ctx, &topic_ids, 6, 3, 10);
+
+    // Publish 5 messages to each of 2 topics
+    for &id in &topic_ids {
+        for i in 0u64..5 {
+            producer.publish_id(id, &i).unwrap();
+        }
+    }
+
+    handle.release();
+    let completed = handle.wait(Duration::from_secs(10));
+    assert!(completed, "multiplexed consumers should drain all messages");
 }
