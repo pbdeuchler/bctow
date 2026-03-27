@@ -1,6 +1,6 @@
 #[allow(dead_code)]
 mod harness {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
@@ -15,39 +15,31 @@ mod harness {
     pub fn thread_ceiling() -> usize {
         *THREAD_CEILING.get_or_init(|| {
             // Binary search between 1 and 4096 for the thread ceiling.
-            // We probe by spawning N threads that immediately park, then join them.
+            // Probe by spawning N threads with trivial bodies and joining them.
+            // No barrier — threads just exit immediately to avoid any blocking.
             let mut lo = 1usize;
             let mut hi = 4096usize;
             let mut last_success = 1usize;
 
             while lo <= hi {
                 let mid = lo + (hi - lo) / 2;
-                let barrier = Arc::new(Barrier::new(mid + 1));
                 let handles: Vec<_> = (0..mid)
                     .map(|_| {
-                        let b = Arc::clone(&barrier);
                         thread::Builder::new()
                             .stack_size(64 * 1024)
-                            .spawn(move || {
-                                b.wait();
-                            })
+                            .spawn(|| {})
                             .ok()
                     })
                     .collect();
 
                 let all_spawned = handles.iter().all(|h| h.is_some());
+                for h in handles.into_iter().flatten() {
+                    let _ = h.join();
+                }
                 if all_spawned {
-                    barrier.wait();
-                    for h in handles.into_iter().flatten() {
-                        let _ = h.join();
-                    }
                     last_success = mid;
                     lo = mid + 1;
                 } else {
-                    // Some failed — drop any that succeeded without joining
-                    for h in handles.into_iter().flatten() {
-                        let _ = h.join();
-                    }
                     hi = mid - 1;
                 }
             }
@@ -79,7 +71,8 @@ mod harness {
     pub struct ConsumerHandle {
         barrier: Arc<Barrier>,
         done: Arc<AtomicU64>,
-        expected_consumers: u64,
+        thread_count: u64,
+        stop: Arc<AtomicBool>,
         threads: Vec<thread::JoinHandle<()>>,
     }
 
@@ -95,8 +88,9 @@ mod harness {
             let deadline = std::time::Instant::now() + timeout;
             // Spin-check the done counter rather than parking, to avoid
             // re-introducing scheduler-induced latency in bench measurements.
-            while self.done.load(Ordering::Acquire) < self.expected_consumers {
+            while self.done.load(Ordering::Acquire) < self.thread_count {
                 if std::time::Instant::now() >= deadline {
+                    self.stop.store(true, Ordering::Release);
                     return false;
                 }
                 std::hint::spin_loop();
@@ -125,8 +119,9 @@ mod harness {
 
         // +1 for the caller which calls release()
         let barrier = Arc::new(Barrier::new(actual_threads + 1));
-        // Each "done" unit represents one consumer finishing
+        // Incremented once per thread when it exits the drain loop
         let done = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
         let total_messages = (count as u64) * messages_per_consumer;
 
         // Create all clients up front on the calling thread (ConsumerContext is Sync)
@@ -156,9 +151,10 @@ mod harness {
             let b = Arc::clone(&barrier);
             let ctr = Arc::clone(&counter);
             let done_flag = Arc::clone(&done);
+            let stop_flag = Arc::clone(&stop);
 
             let handle = thread::spawn(move || {
-                drain_loop(batch, b, total_messages, ctr);
+                drain_loop(batch, b, total_messages, ctr, stop_flag);
                 done_flag.fetch_add(1, Ordering::Release);
             });
             thread_handles.push(handle);
@@ -167,34 +163,38 @@ mod harness {
         ConsumerHandle {
             barrier,
             done,
-            expected_consumers: actual_threads as u64,
+            thread_count: actual_threads as u64,
+            stop,
             threads: thread_handles,
         }
     }
 
     /// Per-thread poll loop. Waits on `barrier`, then polls all owned clients in
     /// round-robin, incrementing `counter` on each received message. Exits when
-    /// the shared counter reaches `messages_expected`.
+    /// the shared counter reaches `messages_expected` or `stop` is set.
     pub fn drain_loop<T: Copy + Send + Sync + 'static>(
         mut clients: Vec<ConsumerClient<T>>,
         barrier: Arc<Barrier>,
         messages_expected: u64,
         counter: Arc<AtomicU64>,
+        stop: Arc<AtomicBool>,
     ) {
         barrier.wait();
-        let n = clients.len();
-        if n == 0 {
+        if clients.is_empty() {
             return;
         }
         loop {
-            let current = counter.load(Ordering::Relaxed);
+            let current = counter.load(Ordering::Acquire);
             if current >= messages_expected {
+                break;
+            }
+            if stop.load(Ordering::Acquire) {
                 break;
             }
             for client in &mut clients {
                 if let Some(msg) = client.poll() {
                     std::hint::black_box(msg);
-                    counter.fetch_add(1, Ordering::Relaxed);
+                    counter.fetch_add(1, Ordering::AcqRel);
                 }
             }
         }
@@ -203,9 +203,14 @@ mod harness {
     /// Produces a deterministic non-zero fill pattern for `FixedBytes<N>`.
     /// Cycles through 0x01..=0xFF so there are no zero bytes.
     pub fn fill_fixed_bytes<const N: usize>() -> FixedBytes<N> {
-        let data: Vec<u8> = (0..N).map(|i| ((i % 255) + 1) as u8).collect();
+        let mut data = [0u8; N];
+        for i in 0..N {
+            data[i] = ((i % 255) + 1) as u8;
+        }
         FixedBytes::new(&data).expect("fill_fixed_bytes: slice fits in N")
     }
 }
 
-fn main() {}
+fn main() {
+    // Placeholder — replaced by criterion_main!() in Step 2
+}
