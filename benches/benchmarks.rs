@@ -211,7 +211,7 @@ mod harness {
     }
 }
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, Criterion};
 
 fn operations_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("operations");
@@ -324,4 +324,131 @@ fn message_size_benchmark(c: &mut Criterion) {
 }
 
 criterion_group!(benches, operations_benchmark, message_size_benchmark);
-criterion_main!(benches);
+// DO NOT use criterion_main! — we have a custom main that runs scaling benchmarks first.
+
+fn consumer_scaling() {
+    let consumer_counts = [1, 10, 50, 100, 250, 500, 1000, 2000];
+    let message_count = 1000u64;
+
+    for &consumers in &consumer_counts {
+        let (producer, ctx, topic_ids) = harness::setup_broker::<u64>(1, 1024);
+        let topic_id = topic_ids[0];
+
+        // Each consumer sees all message_count messages; total deliveries = consumers * message_count.
+        let handle = harness::spawn_consumers(&ctx, &topic_ids, consumers, consumers, message_count);
+
+        // Publish all messages before releasing consumers so they drain in one burst.
+        // capacity=1024 >= message_count=1000 so all fit in the ring.
+        for i in 0..message_count {
+            producer.publish_id(topic_id, &i).unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        handle.release();
+        let completed = handle.wait(std::time::Duration::from_secs(30));
+        let elapsed = start.elapsed();
+
+        let total_deliveries = (consumers as u64) * message_count;
+        let elapsed_ns = elapsed.as_nanos() as f64;
+        let throughput = total_deliveries as f64 / (elapsed_ns / 1_000_000_000.0);
+        let latency_ns = elapsed_ns / total_deliveries as f64;
+
+        println!(
+            "[scaling/consumer_scaling] consumers={consumers} threads={} messages={message_count} throughput_msg_sec={throughput:.0} latency_ns_per_msg={latency_ns:.0} elapsed_ms={:.2} completed={completed}",
+            consumers.min(harness::thread_ceiling()),
+            elapsed.as_secs_f64() * 1000.0
+        );
+    }
+}
+
+fn topic_scaling() {
+    let topic_counts = [1, 10, 100, 1000, 10000];
+    let messages_per_topic = 100u64;
+
+    for &topics in &topic_counts {
+        // Reduce capacity for high topic counts to control memory usage.
+        let capacity = if topics >= 10000 { 128 } else { 1024 };
+        let (producer, ctx, topic_ids) = harness::setup_broker::<u64>(topics, capacity);
+
+        let mut client = ctx.create_client();
+        for &id in &topic_ids {
+            client.subscribe_id(id).unwrap();
+        }
+
+        // Publish all messages up front; at 10K topics this primarily measures
+        // poll()'s O(N) HashMap scan over subscriptions, not ring performance.
+        for &id in &topic_ids {
+            for i in 0..messages_per_topic {
+                producer.publish_id(id, &i).unwrap();
+            }
+        }
+
+        let total_messages = topics as u64 * messages_per_topic;
+        let mut received = 0u64;
+        let start = std::time::Instant::now();
+        while received < total_messages {
+            if let Some(msg) = client.poll() {
+                std::hint::black_box(msg);
+                received += 1;
+            }
+        }
+        let elapsed = start.elapsed();
+
+        let elapsed_ns = elapsed.as_nanos() as f64;
+        let throughput = total_messages as f64 / (elapsed_ns / 1_000_000_000.0);
+        let latency_ns = elapsed_ns / total_messages as f64;
+
+        println!(
+            "[scaling/topic_scaling] topics={topics} messages_per_topic={messages_per_topic} total_messages={total_messages} throughput_msg_sec={throughput:.0} latency_ns_per_msg={latency_ns:.0} elapsed_ms={:.2}",
+            elapsed.as_secs_f64() * 1000.0
+        );
+    }
+}
+
+fn combined_scaling() {
+    // [topics, consumers] configurations
+    let configs: &[(usize, usize)] = &[(10, 100), (100, 10), (100, 100)];
+    let messages_per_topic = 100u64;
+
+    for &(topics, consumers) in configs {
+        let (producer, ctx, topic_ids) = harness::setup_broker::<u64>(topics, 1024);
+
+        // Each consumer is subscribed to all topics and expects topics * messages_per_topic messages.
+        let msgs_per_consumer = topics as u64 * messages_per_topic;
+        let handle = harness::spawn_consumers(&ctx, &topic_ids, consumers, consumers, msgs_per_consumer);
+
+        // Publish all messages before releasing consumers.
+        for &id in &topic_ids {
+            for i in 0..messages_per_topic {
+                producer.publish_id(id, &i).unwrap();
+            }
+        }
+
+        let start = std::time::Instant::now();
+        handle.release();
+        let completed = handle.wait(std::time::Duration::from_secs(60));
+        let elapsed = start.elapsed();
+
+        let total_deliveries = (consumers as u64) * msgs_per_consumer;
+        let elapsed_ns = elapsed.as_nanos() as f64;
+        let throughput = total_deliveries as f64 / (elapsed_ns / 1_000_000_000.0);
+        let latency_ns = elapsed_ns / total_deliveries as f64;
+
+        println!(
+            "[scaling/combined_scaling] topics={topics} consumers={consumers} messages_per_topic={messages_per_topic} throughput_msg_sec={throughput:.0} latency_ns_per_msg={latency_ns:.0} elapsed_ms={:.2} completed={completed}",
+            elapsed.as_secs_f64() * 1000.0
+        );
+    }
+}
+
+fn scaling_benchmarks() {
+    println!("\n=== Scaling Benchmarks ===\n");
+    consumer_scaling();
+    topic_scaling();
+    combined_scaling();
+}
+
+fn main() {
+    scaling_benchmarks();
+    benches();
+}
