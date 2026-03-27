@@ -238,8 +238,9 @@ fn operations_benchmark(c: &mut Criterion) {
         });
     });
 
-    // poll_hit: publish one message then poll it. Round-trip cost.
-    // Delta between this and publish_id_warm isolates the poll (read_into + copy) cost.
+    // poll_hit: publish one message then poll it. Measures publish+poll round-trip.
+    // Subtracting publish_id_warm from this isolates the poll cost, assuming
+    // publish_id overhead is identical in both benchmarks (same code path).
     group.bench_function("poll_hit", |b| {
         let (producer, ctx, topic_ids) = harness::setup_broker::<u64>(1, 1024);
         let topic_id = topic_ids[0];
@@ -268,6 +269,8 @@ fn operations_benchmark(c: &mut Criterion) {
 fn message_size_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("message_size");
 
+    // u64 baseline — intentionally overlaps with operations/poll_hit to establish
+    // the copy-cost floor within this group for comparison against larger types.
     group.bench_function("u64", |b| {
         let (producer, ctx, topic_ids) = harness::setup_broker::<u64>(1, 1024);
         let topic_id = topic_ids[0];
@@ -275,7 +278,7 @@ fn message_size_benchmark(c: &mut Criterion) {
         client.subscribe_id(topic_id).unwrap();
         let val: u64 = 42;
         b.iter(|| {
-            producer.publish_id(topic_id, black_box(&val)).unwrap();
+            producer.publish_id(black_box(topic_id), black_box(&val)).unwrap();
             black_box(client.poll());
         });
     });
@@ -287,7 +290,7 @@ fn message_size_benchmark(c: &mut Criterion) {
         client.subscribe_id(topic_id).unwrap();
         let val = harness::fill_fixed_bytes::<64>();
         b.iter(|| {
-            producer.publish_id(topic_id, black_box(&val)).unwrap();
+            producer.publish_id(black_box(topic_id), black_box(&val)).unwrap();
             black_box(client.poll());
         });
     });
@@ -299,7 +302,7 @@ fn message_size_benchmark(c: &mut Criterion) {
         client.subscribe_id(topic_id).unwrap();
         let val = harness::fill_fixed_bytes::<512>();
         b.iter(|| {
-            producer.publish_id(topic_id, black_box(&val)).unwrap();
+            producer.publish_id(black_box(topic_id), black_box(&val)).unwrap();
             black_box(client.poll());
         });
     });
@@ -312,7 +315,7 @@ fn message_size_benchmark(c: &mut Criterion) {
         client.subscribe_id(topic_id).unwrap();
         let val = harness::fill_fixed_bytes::<4096>();
         b.iter(|| {
-            producer.publish_id(topic_id, black_box(&val)).unwrap();
+            producer.publish_id(black_box(topic_id), black_box(&val)).unwrap();
             black_box(client.poll());
         });
     });
