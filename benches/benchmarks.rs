@@ -323,8 +323,9 @@ fn message_size_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
+// criterion_group! generates a callable function `benches` that creates a Criterion
+// instance and runs the registered benchmark groups. We call it from our custom main().
 criterion_group!(benches, operations_benchmark, message_size_benchmark);
-// DO NOT use criterion_main! — we have a custom main that runs scaling benchmarks first.
 
 fn consumer_scaling() {
     let consumer_counts = [1, 10, 50, 100, 250, 500, 1000, 2000];
@@ -343,8 +344,8 @@ fn consumer_scaling() {
             producer.publish_id(topic_id, &i).unwrap();
         }
 
-        let start = std::time::Instant::now();
         handle.release();
+        let start = std::time::Instant::now();
         let completed = handle.wait(std::time::Duration::from_secs(30));
         let elapsed = start.elapsed();
 
@@ -385,21 +386,30 @@ fn topic_scaling() {
 
         let total_messages = topics as u64 * messages_per_topic;
         let mut received = 0u64;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let start = std::time::Instant::now();
-        while received < total_messages {
+        let completed = loop {
+            if received >= total_messages {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
             if let Some(msg) = client.poll() {
                 std::hint::black_box(msg);
                 received += 1;
             }
-        }
+        };
         let elapsed = start.elapsed();
 
         let elapsed_ns = elapsed.as_nanos() as f64;
-        let throughput = total_messages as f64 / (elapsed_ns / 1_000_000_000.0);
-        let latency_ns = elapsed_ns / total_messages as f64;
+        let throughput = received as f64 / (elapsed_ns / 1_000_000_000.0);
+        let latency_ns = if received > 0 { elapsed_ns / received as f64 } else { 0.0 };
 
+        // At 10K topics the measurement is dominated by poll()'s O(N) HashMap scan.
+        let note = if topics >= 10000 { " note=primarily_measures_poll_scan" } else { "" };
         println!(
-            "[scaling/topic_scaling] topics={topics} messages_per_topic={messages_per_topic} total_messages={total_messages} throughput_msg_sec={throughput:.0} latency_ns_per_msg={latency_ns:.0} elapsed_ms={:.2}",
+            "[scaling/topic_scaling] topics={topics} messages_per_topic={messages_per_topic} total_messages={total_messages} throughput_msg_sec={throughput:.0} latency_ns_per_msg={latency_ns:.0} elapsed_ms={:.2} completed={completed}{note}",
             elapsed.as_secs_f64() * 1000.0
         );
     }
@@ -424,8 +434,8 @@ fn combined_scaling() {
             }
         }
 
-        let start = std::time::Instant::now();
         handle.release();
+        let start = std::time::Instant::now();
         let completed = handle.wait(std::time::Duration::from_secs(60));
         let elapsed = start.elapsed();
 
@@ -449,6 +459,15 @@ fn scaling_benchmarks() {
 }
 
 fn main() {
-    scaling_benchmarks();
+    // Run scaling benchmarks only when no Criterion filter is passed, or when
+    // the filter explicitly matches "scaling". This avoids adding seconds of
+    // overhead when iterating on Criterion-only groups like `-- operations`.
+    let args: Vec<String> = std::env::args().collect();
+    let has_filter = args.iter().any(|a| a == "--bench" || a == "--test")
+        || args.iter().skip(1).any(|a| !a.starts_with('-'));
+    let filter_matches_scaling = args.iter().any(|a| a.contains("scaling"));
+    if !has_filter || filter_matches_scaling {
+        scaling_benchmarks();
+    }
     benches();
 }
