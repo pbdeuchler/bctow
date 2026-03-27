@@ -61,6 +61,29 @@ let (producer, ctx) = broker::<FixedBytes<64>>(BctowConfig::default());
 producer.publish("events/raw", &FixedBytes::<64>::new(b"hello").unwrap()).unwrap();
 ```
 
+## Benchmarks
+
+Run the full benchmark suite:
+
+```bash
+cargo bench --all-features
+```
+
+The suite includes:
+
+- **operations** (Criterion): per-call latency for `publish_id`, `publish` (string lookup), `poll` hit/miss
+- **message_size** (Criterion): publish+poll round-trip for `u64`, `FixedBytes<64>`, `FixedBytes<512>`, `FixedBytes<4096>`
+- **scaling** (custom harness): consumer scaling [1–2000], topic scaling [1–10K], combined scaling
+- **stress** (custom harness): contention cliff (power-of-2 sweep), sparse poll (10K topics), overflow policy comparison, large message fanout (4KB)
+
+Run individual groups with filters:
+
+```bash
+cargo bench --all-features -- operations
+cargo bench --all-features -- scaling
+cargo bench --all-features -- stress
+```
+
 ## Optional feature
 
 - `metrics`: exposes `ConsumerContext::metrics()` with relaxed-atomic counters.
