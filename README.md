@@ -84,6 +84,12 @@ cargo bench --all-features -- scaling
 cargo bench --all-features -- stress
 ```
 
+Focused Criterion groups `subscription_scan`, `ring_capacity`, `broadcast`, and
+`broadcast_overwrite` cover sparse subscriptions, arbitrary ring capacities, and
+concurrent retained or overwritten batches. See [performance measurements and
+remaining tradeoffs](docs/performance.md) for results, research, and reproduction
+details.
+
 ## Optional feature
 
 - `metrics`: exposes `ConsumerContext::metrics()` with relaxed-atomic counters.

@@ -259,7 +259,9 @@ fn overwrite_broadcast_benchmark(c: &mut Criterion) {
                 BatchSize::PerIteration,
             );
         });
-        println!("[broadcast_overwrite/deliveries] consumers={consumers} batches={} mean={:.1} min={} max={}", observations.0, observations.1 as f64 / observations.0 as f64, observations.2, observations.3);
+        if observations.0 != 0 {
+            println!("[broadcast_overwrite/deliveries] consumers={consumers} batches={} mean={:.1} min={} max={}", observations.0, observations.1 as f64 / observations.0 as f64, observations.2, observations.3);
+        }
     }
     group.finish();
 }
