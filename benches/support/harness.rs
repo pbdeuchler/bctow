@@ -1,5 +1,6 @@
+use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{mpsc, Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
@@ -9,48 +10,6 @@ use bctow::{
 
 pub const CONTENTION_CAPACITY: usize = 64;
 pub const CONTENTION_MESSAGES: u64 = 4096;
-
-static THREAD_CEILING: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-
-/// Empirically determines the maximum number of threads this process can spawn.
-/// Binary searches for the highest N where spawning N threads succeeds. Result
-/// is cached in a OnceLock so the probe only runs once.
-pub fn thread_ceiling() -> usize {
-    *THREAD_CEILING.get_or_init(|| {
-        // Binary search between 1 and 4096 for the thread ceiling.
-        // Probe by spawning N threads with trivial bodies and joining them.
-        // No barrier — threads just exit immediately to avoid any blocking.
-        let mut lo = 1usize;
-        let mut hi = 4096usize;
-        let mut last_success = 1usize;
-
-        while lo <= hi {
-            let mid = lo + (hi - lo) / 2;
-            let handles: Vec<_> = (0..mid)
-                .map(|_| {
-                    thread::Builder::new()
-                        .stack_size(64 * 1024)
-                        .spawn(|| {})
-                        .ok()
-                })
-                .collect();
-
-            let all_spawned = handles.iter().all(|h| h.is_some());
-            for h in handles.into_iter().flatten() {
-                let _ = h.join();
-            }
-            if all_spawned {
-                last_success = mid;
-                lo = mid + 1;
-            } else {
-                hi = mid - 1;
-            }
-        }
-
-        // Reserve headroom for the caller's own threads
-        last_success.saturating_sub(8).max(1)
-    })
-}
 
 /// Create a broker with `capacity`-slot rings, register `topics` topics by the
 /// pattern `"topic/{i}"`, and return the producer, consumer context, and topic IDs.
@@ -80,6 +39,11 @@ pub struct ConsumerHandle {
 }
 
 impl ConsumerHandle {
+    /// Number of workers actually running, including when spawning was limited.
+    pub fn thread_count(&self) -> usize {
+        self.threads.len()
+    }
+
     /// Release the barrier so all consumer threads begin polling.
     pub fn release(&self) {
         self.barrier.wait();
@@ -102,25 +66,37 @@ impl ConsumerHandle {
             std::hint::spin_loop();
         }
         for h in self.threads.drain(..) {
-            let _ = h.join();
+            h.join().expect("consumer thread panicked");
         }
         true
     }
 }
 
-/// Spawn consumer threads. Creates `count` ConsumerClient instances, each
-/// subscribed to all `topic_ids`. Distributes clients across
-/// `min(count, thread_ceiling())` threads. Returns a ConsumerHandle whose
-/// `release()` unblocks all threads, and whose `wait()` blocks until all
-/// clients have drained `messages_per_consumer` messages.
+/// Completion condition for each workload.
+#[derive(Clone, Copy)]
+pub enum DrainTarget<T> {
+    Messages(u64),
+    Terminal(fn(&T) -> bool),
+}
+
+/// Spawn up to `min(count, threads)` live workers, then distribute all clients
+/// among those that could be created. No speculative thread probe is needed.
+/// Returns an error for zero counts or if no worker can be spawned.
 pub fn spawn_consumers<T: Copy + Send + Sync + 'static>(
     ctx: &ConsumerContext<T>,
     topic_ids: &[TopicId],
     count: usize,
     threads: usize,
     messages_per_consumer: u64,
-) -> ConsumerHandle {
-    spawn_workers(ctx, topic_ids, count, threads, messages_per_consumer, None)
+) -> io::Result<ConsumerHandle> {
+    spawn_workers_with(
+        ctx,
+        topic_ids,
+        count,
+        threads,
+        DrainTarget::Messages(messages_per_consumer),
+        |task| thread::Builder::new().spawn(task),
+    )
 }
 
 /// Drain each client until it observes the terminal message. Earlier messages
@@ -131,27 +107,40 @@ pub fn spawn_consumers_until<T: Copy + Send + Sync + 'static>(
     count: usize,
     threads: usize,
     is_terminal: fn(&T) -> bool,
-) -> ConsumerHandle {
-    spawn_workers(ctx, topic_ids, count, threads, 0, Some(is_terminal))
+) -> io::Result<ConsumerHandle> {
+    spawn_workers_with(
+        ctx,
+        topic_ids,
+        count,
+        threads,
+        DrainTarget::Terminal(is_terminal),
+        |task| thread::Builder::new().spawn(task),
+    )
 }
 
-fn spawn_workers<T: Copy + Send + Sync + 'static>(
+/// The spawn capability is explicit so resource exhaustion can be tested
+/// without relying on process-wide limits or creating thousands of threads.
+pub fn spawn_workers_with<T: Copy + Send + Sync + 'static>(
     ctx: &ConsumerContext<T>,
     topic_ids: &[TopicId],
     count: usize,
     threads: usize,
-    messages_per_consumer: u64,
-    is_terminal: Option<fn(&T) -> bool>,
-) -> ConsumerHandle {
-    let ceiling = thread_ceiling();
-    let actual_threads = count.min(threads).min(ceiling);
-
-    // +1 for the caller which calls release()
-    let barrier = Arc::new(Barrier::new(actual_threads + 1));
+    target: DrainTarget<T>,
+    mut spawn: impl FnMut(Box<dyn FnOnce() + Send>) -> io::Result<thread::JoinHandle<()>>,
+) -> io::Result<ConsumerHandle> {
+    if count == 0 || threads == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "consumer and thread counts must be positive",
+        ));
+    }
     // Incremented once per thread when it exits the drain loop
     let done = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
-    let total_messages = (count as u64) * messages_per_consumer;
+    let (total_messages, is_terminal) = match target {
+        DrainTarget::Messages(messages) => ((count as u64) * messages, None),
+        DrainTarget::Terminal(predicate) => (0, Some(predicate)),
+    };
 
     // Create all clients up front on the calling thread (ConsumerContext is Sync)
     let mut all_clients: Vec<ConsumerClient<T>> = (0..count)
@@ -164,38 +153,54 @@ fn spawn_workers<T: Copy + Send + Sync + 'static>(
         })
         .collect();
 
-    // Distribute clients across threads in round-robin chunks
-    let clients_per_thread = count / actual_threads;
-    let remainder = count % actual_threads;
-
-    let mut thread_handles = Vec::with_capacity(actual_threads);
+    // Each worker waits for its assignment. Keeping successful workers alive
+    // makes later spawn failures reflect the actual concurrent resource limit.
+    let mut assignments = Vec::new();
+    let mut thread_handles = Vec::new();
     let counter = Arc::new(AtomicU64::new(0));
 
-    for t in 0..actual_threads {
-        // Each thread gets clients_per_thread + (1 if t < remainder)
-        let extra = if t < remainder { 1 } else { 0 };
-        let batch_size = clients_per_thread + extra;
-        let batch: Vec<ConsumerClient<T>> = all_clients.drain(..batch_size).collect();
-
-        let b = Arc::clone(&barrier);
+    for _ in 0..count.min(threads) {
+        let (send, receive) = mpsc::channel::<(Vec<ConsumerClient<T>>, Arc<Barrier>)>();
         let ctr = Arc::clone(&counter);
         let done_flag = Arc::clone(&done);
         let stop_flag = Arc::clone(&stop);
 
-        let handle = thread::spawn(move || {
-            drain_loop_until(batch, b, total_messages, ctr, stop_flag, is_terminal);
-            done_flag.fetch_add(1, Ordering::Release);
+        let task = Box::new(move || {
+            if let Ok((batch, barrier)) = receive.recv() {
+                drain_loop_until(batch, barrier, total_messages, ctr, stop_flag, is_terminal);
+                done_flag.fetch_add(1, Ordering::Release);
+            }
         });
-        thread_handles.push(handle);
+        match spawn(task) {
+            Ok(handle) => {
+                assignments.push(send);
+                thread_handles.push(handle);
+            }
+            Err(error) if thread_handles.is_empty() => return Err(error),
+            Err(_) => break,
+        }
     }
 
-    ConsumerHandle {
+    let actual_threads = thread_handles.len();
+    let barrier = Arc::new(Barrier::new(actual_threads + 1));
+    let clients_per_thread = count / actual_threads;
+    let remainder = count % actual_threads;
+    for (t, send) in assignments.into_iter().enumerate() {
+        let batch_size = clients_per_thread + usize::from(t < remainder);
+        let batch = all_clients.drain(..batch_size).collect();
+        assert!(
+            send.send((batch, Arc::clone(&barrier))).is_ok(),
+            "consumer thread exited before assignment"
+        );
+    }
+
+    Ok(ConsumerHandle {
         barrier,
         done,
         thread_count: actual_threads as u64,
         stop,
         threads: thread_handles,
-    }
+    })
 }
 
 /// Per-thread poll loop. Waits on `barrier`, then polls all owned clients in
@@ -254,8 +259,8 @@ fn drain_loop_until<T: Copy + Send + Sync + 'static>(
 /// Cycles through 0x01..=0xFF so there are no zero bytes.
 pub fn fill_fixed_bytes<const N: usize>() -> FixedBytes<N> {
     let mut data = [0u8; N];
-    for i in 0..N {
-        data[i] = ((i % 255) + 1) as u8;
+    for (i, byte) in data.iter_mut().enumerate() {
+        *byte = ((i % 255) + 1) as u8;
     }
     FixedBytes::new(&data).expect("fill_fixed_bytes: slice fits in N")
 }

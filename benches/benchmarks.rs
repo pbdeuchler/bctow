@@ -17,7 +17,9 @@ fn operations_benchmark(c: &mut Criterion) {
         // Warm the producer's ring cache with one publish before measuring.
         producer.publish_id(topic_id, &0u64).unwrap();
         b.iter(|| {
-            producer.publish_id(black_box(topic_id), black_box(&42u64)).unwrap();
+            producer
+                .publish_id(black_box(topic_id), black_box(&42u64))
+                .unwrap();
         });
     });
 
@@ -28,7 +30,9 @@ fn operations_benchmark(c: &mut Criterion) {
         // Warm with one publish so the ring cache entry exists.
         producer.publish("topic/0", &0u64).unwrap();
         b.iter(|| {
-            producer.publish(black_box("topic/0"), black_box(&42u64)).unwrap();
+            producer
+                .publish(black_box("topic/0"), black_box(&42u64))
+                .unwrap();
         });
     });
 
@@ -72,7 +76,9 @@ fn message_size_benchmark(c: &mut Criterion) {
         client.subscribe_id(topic_id).unwrap();
         let val: u64 = 42;
         b.iter(|| {
-            producer.publish_id(black_box(topic_id), black_box(&val)).unwrap();
+            producer
+                .publish_id(black_box(topic_id), black_box(&val))
+                .unwrap();
             black_box(client.poll());
         });
     });
@@ -84,7 +90,9 @@ fn message_size_benchmark(c: &mut Criterion) {
         client.subscribe_id(topic_id).unwrap();
         let val = harness::fill_fixed_bytes::<64>();
         b.iter(|| {
-            producer.publish_id(black_box(topic_id), black_box(&val)).unwrap();
+            producer
+                .publish_id(black_box(topic_id), black_box(&val))
+                .unwrap();
             black_box(client.poll());
         });
     });
@@ -96,20 +104,23 @@ fn message_size_benchmark(c: &mut Criterion) {
         client.subscribe_id(topic_id).unwrap();
         let val = harness::fill_fixed_bytes::<512>();
         b.iter(|| {
-            producer.publish_id(black_box(topic_id), black_box(&val)).unwrap();
+            producer
+                .publish_id(black_box(topic_id), black_box(&val))
+                .unwrap();
             black_box(client.poll());
         });
     });
 
     group.bench_function("fixed_bytes_4096", |b| {
-        let (producer, ctx, topic_ids) =
-            harness::setup_broker::<bctow::FixedBytes<4096>>(1, 1024);
+        let (producer, ctx, topic_ids) = harness::setup_broker::<bctow::FixedBytes<4096>>(1, 1024);
         let topic_id = topic_ids[0];
         let mut client = ctx.create_client();
         client.subscribe_id(topic_id).unwrap();
         let val = harness::fill_fixed_bytes::<4096>();
         b.iter(|| {
-            producer.publish_id(black_box(topic_id), black_box(&val)).unwrap();
+            producer
+                .publish_id(black_box(topic_id), black_box(&val))
+                .unwrap();
             black_box(client.poll());
         });
     });
@@ -130,7 +141,17 @@ fn consumer_scaling() {
         let topic_id = topic_ids[0];
 
         // Each consumer sees all message_count messages; total deliveries = consumers * message_count.
-        let handle = harness::spawn_consumers(&ctx, &topic_ids, consumers, consumers, message_count);
+        let handle =
+            match harness::spawn_consumers(&ctx, &topic_ids, consumers, consumers, message_count) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    eprintln!(
+                        "[scaling/consumer_scaling] consumers={consumers} unavailable: {error}"
+                    );
+                    continue;
+                }
+            };
+        let actual_threads = handle.thread_count();
 
         // Publish all messages before releasing consumers so they drain in one burst.
         // capacity=1024 >= message_count=1000 so all fit in the ring.
@@ -150,7 +171,7 @@ fn consumer_scaling() {
 
         println!(
             "[scaling/consumer_scaling] consumers={consumers} threads={} messages={message_count} throughput_msg_sec={throughput:.0} latency_ns_per_msg={latency_ns:.0} elapsed_ms={:.2} completed={completed}",
-            consumers.min(harness::thread_ceiling()),
+            actual_threads,
             elapsed.as_secs_f64() * 1000.0
         );
     }
@@ -198,10 +219,18 @@ fn topic_scaling() {
 
         let elapsed_ns = elapsed.as_nanos() as f64;
         let throughput = received as f64 / (elapsed_ns / 1_000_000_000.0);
-        let latency_ns = if received > 0 { elapsed_ns / received as f64 } else { 0.0 };
+        let latency_ns = if received > 0 {
+            elapsed_ns / received as f64
+        } else {
+            0.0
+        };
 
         // At 10K topics the measurement is dominated by poll()'s O(N) HashMap scan.
-        let note = if topics >= 10000 { " note=primarily_measures_poll_scan" } else { "" };
+        let note = if topics >= 10000 {
+            " note=primarily_measures_poll_scan"
+        } else {
+            ""
+        };
         println!(
             "[scaling/topic_scaling] topics={topics} messages_per_topic={messages_per_topic} total_messages={total_messages} throughput_msg_sec={throughput:.0} latency_ns_per_msg={latency_ns:.0} elapsed_ms={:.2} completed={completed}{note}",
             elapsed.as_secs_f64() * 1000.0
@@ -219,7 +248,20 @@ fn combined_scaling() {
 
         // Each consumer is subscribed to all topics and expects topics * messages_per_topic messages.
         let msgs_per_consumer = topics as u64 * messages_per_topic;
-        let handle = harness::spawn_consumers(&ctx, &topic_ids, consumers, consumers, msgs_per_consumer);
+        let handle = match harness::spawn_consumers(
+            &ctx,
+            &topic_ids,
+            consumers,
+            consumers,
+            msgs_per_consumer,
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                eprintln!("[scaling/combined_scaling] consumers={consumers} unavailable: {error}");
+                continue;
+            }
+        };
+        let actual_threads = handle.thread_count();
 
         // Publish all messages before releasing consumers.
         for &id in &topic_ids {
@@ -239,7 +281,7 @@ fn combined_scaling() {
         let latency_ns = elapsed_ns / total_deliveries as f64;
 
         println!(
-            "[scaling/combined_scaling] topics={topics} consumers={consumers} messages_per_topic={messages_per_topic} throughput_msg_sec={throughput:.0} latency_ns_per_msg={latency_ns:.0} elapsed_ms={:.2} completed={completed}",
+            "[scaling/combined_scaling] topics={topics} consumers={consumers} threads={actual_threads} messages_per_topic={messages_per_topic} throughput_msg_sec={throughput:.0} latency_ns_per_msg={latency_ns:.0} elapsed_ms={:.2} completed={completed}",
             elapsed.as_secs_f64() * 1000.0
         );
     }
@@ -272,10 +314,20 @@ fn contention_cliff() {
         let val = harness::fill_fixed_bytes::<512>();
 
         // Thread-per-consumer: pass `consumers` as both count and thread limit.
-        let handle =
-            harness::spawn_consumers_until(&ctx, &[topic_id], consumers, consumers, |message| {
-                message.is_empty()
-            });
+        let handle = match harness::spawn_consumers_until(
+            &ctx,
+            &[topic_id],
+            consumers,
+            consumers,
+            |message| message.is_empty(),
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                eprintln!("[stress/contention_cliff] consumers={consumers} unavailable: {error}");
+                continue;
+            }
+        };
+        let actual_threads = handle.thread_count();
 
         // Release consumers first, then publish through many complete ring wraps.
         handle.release();
@@ -296,10 +348,9 @@ fn contention_cliff() {
         let publish_ns_per_msg = publish_ns / message_count as f64;
         let throughput = message_count as f64 / (publish_ns / 1_000_000_000.0);
 
-        let actual_threads = consumers.min(harness::thread_ceiling());
         if actual_threads < consumers {
             println!(
-                "  WARNING: contention_cliff consumers={consumers} exceeds thread_ceiling={actual_threads}, results reflect multiplexed contention"
+                "  WARNING: contention_cliff consumers={consumers} threads={actual_threads}, results reflect multiplexed contention"
             );
         }
         println!(
@@ -356,7 +407,11 @@ fn sparse_poll() {
 
     let elapsed_ns = elapsed.as_nanos() as f64;
     let throughput = received as f64 / (elapsed_ns / 1_000_000_000.0);
-    let latency_ns = if received > 0 { elapsed_ns / received as f64 } else { 0.0 };
+    let latency_ns = if received > 0 {
+        elapsed_ns / received as f64
+    } else {
+        0.0
+    };
 
     println!(
         "[stress/sparse_poll] topics={topic_count} active_topics=1 messages={message_count} throughput_msg_sec={throughput:.0} latency_ns_per_msg={latency_ns:.0} elapsed_ms={:.2} note=O(subscriptions)_scan_per_poll",
@@ -458,12 +513,21 @@ fn large_message_fanout() {
     let message_count = 100u64;
 
     for &consumers in consumer_counts {
-        let (producer, ctx, topic_ids) =
-            harness::setup_broker::<bctow::FixedBytes<4096>>(1, 1024);
+        let (producer, ctx, topic_ids) = harness::setup_broker::<bctow::FixedBytes<4096>>(1, 1024);
         let topic_id = topic_ids[0];
         let val = harness::fill_fixed_bytes::<4096>();
 
-        let handle = harness::spawn_consumers(&ctx, &topic_ids, consumers, consumers, message_count);
+        let handle =
+            match harness::spawn_consumers(&ctx, &topic_ids, consumers, consumers, message_count) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    eprintln!(
+                        "[stress/large_message_fanout] consumers={consumers} unavailable: {error}"
+                    );
+                    continue;
+                }
+            };
+        let actual_threads = handle.thread_count();
 
         for _ in 0..message_count {
             producer.publish_id(topic_id, &val).unwrap();
@@ -480,7 +544,7 @@ fn large_message_fanout() {
         let latency_ns = elapsed_ns / total_deliveries as f64;
 
         println!(
-            "[stress/large_message_fanout] consumers={consumers} message_size=4096 messages={message_count} throughput_msg_sec={throughput:.0} latency_ns_per_msg={latency_ns:.0} elapsed_ms={:.2} completed={completed}",
+            "[stress/large_message_fanout] consumers={consumers} threads={actual_threads} message_size=4096 messages={message_count} throughput_msg_sec={throughput:.0} latency_ns_per_msg={latency_ns:.0} elapsed_ms={:.2} completed={completed}",
             elapsed.as_secs_f64() * 1000.0,
         );
     }
@@ -499,12 +563,14 @@ fn main() {
     // user supplied a filter so we can skip custom benchmarks when they only
     // target a Criterion group (e.g., `-- operations`). Note: cargo always
     // injects `--bench`, so we must ignore flags when detecting a user filter.
-    let positional_filter: Option<String> = std::env::args()
-        .skip(1)
-        .find(|a| !a.starts_with('-'));
+    let positional_filter: Option<String> = std::env::args().skip(1).find(|a| !a.starts_with('-'));
 
-    let run_scaling = positional_filter.as_ref().map_or(true, |f| f.contains("scaling"));
-    let run_stress = positional_filter.as_ref().map_or(true, |f| f.contains("stress"));
+    let run_scaling = positional_filter
+        .as_ref()
+        .is_none_or(|f| f.contains("scaling"));
+    let run_stress = positional_filter
+        .as_ref()
+        .is_none_or(|f| f.contains("stress"));
 
     if run_scaling {
         scaling_benchmarks();
