@@ -66,7 +66,7 @@ impl<T: Copy> RingBuffer<T> {
             })
             .expect("ring sequence overflow");
 
-        let idx = ((seq - 1) as usize) % self.capacity;
+        let idx = ((seq - 1) % self.capacity as u64) as usize;
         let slot = &self.slots[idx];
 
         let prior_access = slot.access.fetch_or(WRITER, Ordering::AcqRel);
@@ -91,7 +91,7 @@ impl<T: Copy> RingBuffer<T> {
             return None;
         }
 
-        let idx = ((seq - 1) as usize) % self.capacity;
+        let idx = ((seq - 1) % self.capacity as u64) as usize;
         let slot = &self.slots[idx];
 
         let mut access = slot.access.load(Ordering::Relaxed);
@@ -226,6 +226,33 @@ mod tests {
 
         let mut dst = MaybeUninit::<u64>::uninit();
         assert!(ring.read_into(1, &mut dst).is_none());
+    }
+
+    #[test]
+    fn retains_full_capacity_across_sequence_width_boundaries() {
+        for first in [u32::MAX as u64 - 1, u64::MAX - 4] {
+            let ring = RingBuffer::<u64>::new(3);
+            ring.write_seq.store(first, Ordering::Relaxed);
+
+            for seq in first..first + 3 {
+                assert_eq!(ring.push(&seq), seq);
+            }
+
+            let mut dst = MaybeUninit::uninit();
+            for seq in first..first + 3 {
+                ring.read_into(seq, &mut dst).unwrap();
+                assert_eq!(unsafe { dst.assume_init() }, seq);
+            }
+
+            let next = first + 3;
+            assert_eq!(ring.push(&next), next);
+            assert!(ring.read_into(first, &mut dst).is_none());
+            assert_eq!(ring.oldest_available_seq(), first + 1);
+            for seq in first + 1..=next {
+                ring.read_into(seq, &mut dst).unwrap();
+                assert_eq!(unsafe { dst.assume_init() }, seq);
+            }
+        }
     }
 
     #[test]
