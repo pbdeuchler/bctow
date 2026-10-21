@@ -1,5 +1,7 @@
 use std::mem::MaybeUninit;
+use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use bctow::{
     broker, BctowConfig, BctowError, ConsumerClient, ConsumerContext, ExactTopic, FixedBytes,
@@ -361,11 +363,12 @@ fn multithreaded_producer_and_consumers_no_panics() {
 #[test]
 fn multithreaded_truly_concurrent_producer_and_consumers() {
     const MSG_COUNT: u64 = 500;
+    const CONSUMERS: usize = 4;
 
     let (producer, ctx) = small_broker(1024, OverflowPolicy::DropOldest);
     producer.publish("concurrent", &0u64).unwrap();
 
-    let clients: Vec<_> = (0..4)
+    let clients: Vec<_> = (0..CONSUMERS)
         .map(|_| {
             let mut client = ctx.create_client();
             client.subscribe("concurrent").unwrap();
@@ -373,18 +376,20 @@ fn multithreaded_truly_concurrent_producer_and_consumers() {
         })
         .collect();
 
+    let start = Arc::new(Barrier::new(CONSUMERS + 1));
     let consumer_handles: Vec<_> = clients
         .into_iter()
         .map(|mut client| {
+            let start = Arc::clone(&start);
             thread::spawn(move || {
                 let mut received = Vec::new();
-                let mut attempts = 0usize;
+                start.wait();
+                let deadline = Instant::now() + Duration::from_secs(5);
 
-                while received.len() < MSG_COUNT as usize && attempts < 100_000 {
+                while received.len() < MSG_COUNT as usize && Instant::now() < deadline {
                     if let Some(message) = client.poll() {
                         received.push(*message.message);
                     } else {
-                        attempts += 1;
                         thread::yield_now();
                     }
                 }
@@ -395,6 +400,7 @@ fn multithreaded_truly_concurrent_producer_and_consumers() {
         .collect();
 
     let producer_handle = thread::spawn(move || {
+        start.wait();
         for value in 1u64..=MSG_COUNT {
             producer.publish("concurrent", &value).unwrap();
         }
@@ -404,8 +410,7 @@ fn multithreaded_truly_concurrent_producer_and_consumers() {
 
     for handle in consumer_handles {
         let values = handle.join().unwrap();
-        assert!(!values.is_empty());
-        assert!(values.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(values, (1..=MSG_COUNT).collect::<Vec<_>>());
     }
 }
 

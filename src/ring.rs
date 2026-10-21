@@ -177,6 +177,7 @@ impl Cursor {
 mod tests {
     use std::sync::Arc;
     use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::*;
 
@@ -259,18 +260,40 @@ mod tests {
     fn retained_reader_blocks_writer_until_copy_finishes() {
         let ring = Arc::new(RingBuffer::<u64>::new(1));
         let seq = ring.push(&100u64);
+        let slot = &ring.slots[0];
+        // Admit and retain a reader using the same CAS as read_into, so the
+        // writer must encounter an active reader rather than a finished copy.
+        slot.access
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .unwrap();
 
-        let reader_ring = Arc::clone(&ring);
-        let reader = thread::spawn(move || {
-            let mut dst = MaybeUninit::<u64>::uninit();
-            reader_ring.read_into(seq, &mut dst).unwrap();
-            assert_eq!(unsafe { dst.assume_init() }, 100u64);
-        });
-
-        reader.join().unwrap();
-
-        let seq2 = ring.push(&200u64);
+        let writer_ring = Arc::clone(&ring);
+        let writer = thread::spawn(move || writer_ring.push(&200u64));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while slot.access.load(Ordering::Acquire) != WRITER | 1 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        let writer_waiting = slot.access.load(Ordering::Acquire) == WRITER | 1;
+        let stored_while_held = slot.sequence.load(Ordering::Relaxed);
         let mut dst = MaybeUninit::<u64>::uninit();
+        let new_reader_blocked = ring.read_into(seq, &mut dst).is_none();
+        let retained_value = writer_waiting.then(|| {
+            // SAFETY: this test owns the retained reader admission until the
+            // release below; the writer has announced itself and must wait.
+            unsafe { (*slot.data.get()).assume_init() }
+        });
+        // Release before asserting, so a failed assertion cannot strand a writer.
+        slot.access.fetch_sub(1, Ordering::Release);
+        let seq2 = writer.join().unwrap();
+
+        assert!(
+            writer_waiting,
+            "writer did not wait for the retained reader"
+        );
+        assert_eq!(stored_while_held, seq);
+        assert!(new_reader_blocked);
+        assert_eq!(retained_value, Some(100));
+        assert!(ring.read_into(seq, &mut dst).is_none());
         ring.read_into(seq2, &mut dst).unwrap();
         assert_eq!(unsafe { dst.assume_init() }, 200u64);
     }
