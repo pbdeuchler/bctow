@@ -34,11 +34,35 @@ impl<T: Copy + Send + Sync + 'static> BrokerInner<T> {
 
     #[cfg(feature = "metrics")]
     pub(crate) fn inc_published(&self) {
-        self.messages_published.fetch_add(1, Ordering::Relaxed);
+        // Only the single producer updates this counter; snapshots only load it.
+        let next = self
+            .messages_published
+            .load(Ordering::Relaxed)
+            .wrapping_add(1);
+        self.messages_published.store(next, Ordering::Relaxed);
     }
 
     #[cfg(feature = "metrics")]
     pub(crate) fn inc_delivered(&self) {
         self.messages_delivered.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(all(test, feature = "metrics"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn published_metrics_count_and_wrap_without_changing_deliveries() {
+        let inner = BrokerInner::<u64>::new(BctowConfig::default());
+        for count in [0, 1, u64::MAX - 1, u64::MAX] {
+            inner.messages_published.store(count, Ordering::Relaxed);
+            inner.inc_published();
+            assert_eq!(
+                inner.messages_published.load(Ordering::Relaxed),
+                count.wrapping_add(1)
+            );
+            assert_eq!(inner.messages_delivered.load(Ordering::Relaxed), 0);
+        }
     }
 }
