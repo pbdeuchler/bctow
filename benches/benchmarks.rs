@@ -5,7 +5,7 @@ mod harness;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 
-use criterion::{black_box, criterion_group, Criterion};
+use criterion::{black_box, criterion_group, BenchmarkId, Criterion};
 
 fn operations_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("operations");
@@ -130,7 +130,56 @@ fn message_size_benchmark(c: &mut Criterion) {
 
 // criterion_group! generates a callable function `benches` that creates a Criterion
 // instance and runs the registered benchmark groups. We call it from our custom main().
-criterion_group!(benches, operations_benchmark, message_size_benchmark);
+fn subscription_scan_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("subscription_scan");
+    for count in [1, 32, 1024, 10_000] {
+        for active in [false, true] {
+            let (producer, ctx, topics) = harness::setup_broker::<u64>(count, 4);
+            let mut client = ctx.create_client();
+            for &topic in &topics {
+                client.subscribe_id(topic).unwrap();
+            }
+            let last = *topics.last().unwrap();
+            let name = if active { "last_active" } else { "idle" };
+            group.bench_with_input(BenchmarkId::new(name, count), &count, |b, _| {
+                b.iter(|| {
+                    if active {
+                        producer.publish_id(last, black_box(&42)).unwrap();
+                        black_box(client.poll().expect("last topic has a pending message"));
+                    } else {
+                        assert!(black_box(client.poll()).is_none());
+                    }
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
+fn ring_capacity_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ring_capacity");
+    for capacity in [1, 3, 31, 32, 1024] {
+        let (producer, ctx, topics) = harness::setup_broker::<u64>(1, capacity);
+        let topic = topics[0];
+        let mut client = ctx.create_client();
+        client.subscribe_id(topic).unwrap();
+        group.bench_with_input(BenchmarkId::from_parameter(capacity), &capacity, |b, _| {
+            b.iter(|| {
+                producer.publish_id(topic, black_box(&42)).unwrap();
+                black_box(client.poll().expect("published message must be retained"));
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    operations_benchmark,
+    message_size_benchmark,
+    subscription_scan_benchmark,
+    ring_capacity_benchmark
+);
 
 fn consumer_scaling() {
     let consumer_counts = [1, 10, 50, 100, 250, 500, 1000, 2000];
