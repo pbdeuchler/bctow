@@ -203,6 +203,11 @@ fn try_read_with_policy<T: Copy>(
 ) -> Option<()> {
     let seq = cursor.next_seq();
 
+    // Idle subscriptions need only the ring header, not its slot allocation.
+    if seq > ring.latest_seq() {
+        return None;
+    }
+
     if ring.read_into(seq, dst).is_some() {
         cursor.advance();
         return Some(());
@@ -373,6 +378,31 @@ mod tests {
         }
         #[cfg(feature = "metrics")]
         assert_eq!(ctx.metrics().messages_delivered, 0);
+    }
+
+    #[test]
+    fn idle_polls_do_not_hide_later_publications() {
+        for into in [false, true] {
+            for policy in [
+                OverflowPolicy::DropOldest,
+                OverflowPolicy::DropNewest,
+                OverflowPolicy::SkipToLatest,
+            ] {
+                let (producer, ctx) = crate::broker::<u64>(crate::BctowConfig {
+                    ring_buffer_capacity: 3,
+                    overflow_policy: policy,
+                });
+                let id = producer.register_topic("intermittent");
+                let mut client = ctx.create_client();
+                client.subscribe_id(id).unwrap();
+                for value in 1..=10 {
+                    assert_eq!(read(&mut client, into), None);
+                    producer.publish_id(id, &value).unwrap();
+                    assert_eq!(read(&mut client, into), Some((id, value)));
+                    assert_eq!(read(&mut client, into), None);
+                }
+            }
+        }
     }
 
     #[test]
