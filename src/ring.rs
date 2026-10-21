@@ -65,7 +65,7 @@ impl<T: Copy> RingBuffer<T> {
         let next = seq.checked_add(1).expect("ring sequence overflow");
         self.write_seq.store(next, Ordering::Release);
 
-        let idx = ((seq - 1) % self.capacity as u64) as usize;
+        let idx = self.slot_index(seq);
         let slot = &self.slots[idx];
 
         let prior_access = slot.access.fetch_or(WRITER, Ordering::AcqRel);
@@ -90,7 +90,7 @@ impl<T: Copy> RingBuffer<T> {
             return None;
         }
 
-        let idx = ((seq - 1) % self.capacity as u64) as usize;
+        let idx = self.slot_index(seq);
         let slot = &self.slots[idx];
 
         // Most empty polls can avoid writing the shared admission counter.
@@ -128,6 +128,16 @@ impl<T: Copy> RingBuffer<T> {
 
         slot.access.fetch_sub(1, Ordering::Release);
         Some(())
+    }
+
+    fn slot_index(&self, seq: u64) -> usize {
+        let offset = seq - 1;
+        let capacity = self.capacity as u64;
+        if capacity.is_power_of_two() {
+            (offset & (capacity - 1)) as usize
+        } else {
+            (offset % capacity) as usize
+        }
     }
 
     pub(crate) fn latest_seq(&self) -> u64 {
@@ -295,6 +305,24 @@ mod tests {
             for seq in first + 1..=next {
                 ring.read_into(seq, &mut dst).unwrap();
                 assert_eq!(unsafe { dst.assume_init() }, seq);
+            }
+        }
+    }
+
+    #[test]
+    fn every_capacity_retains_its_full_window_across_wraps() {
+        for capacity in [1, 2, 3, 4, 31, 32, 33] {
+            let ring = RingBuffer::new(capacity);
+            for value in 1..=(capacity * 3) as u64 {
+                assert_eq!(ring.push(&value), value);
+                let oldest = (value + 1).saturating_sub(capacity as u64).max(1);
+                let mut dst = MaybeUninit::uninit();
+                assert!(ring.read_into(oldest - 1, &mut dst).is_none());
+                for retained in oldest..=value {
+                    ring.read_into(retained, &mut dst).unwrap();
+                    assert_eq!(unsafe { dst.assume_init() }, retained);
+                }
+                assert!(ring.read_into(value + 1, &mut dst).is_none());
             }
         }
     }
