@@ -1,182 +1,14 @@
-/// Tests for the benchmark harness functions.
-/// These exercise the same logic as the harness module in benches/benchmarks.rs,
-/// but are compiled as normal integration tests so they can be run with `cargo test`.
+/// Exercises the actual benchmark harness as normal integration tests.
+#[allow(dead_code)]
+#[path = "../benches/support/harness.rs"]
+mod harness;
+
+use bctow::{BctowConfig, OverflowPolicy};
+use harness::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
-
-use bctow::{BctowConfig, ConsumerContext, FixedBytes, OverflowPolicy, Producer, TopicId};
-
-// ---------------------------------------------------------------------------
-// Inline harness helpers (mirrors benches/benchmarks.rs harness module)
-// ---------------------------------------------------------------------------
-
-fn thread_ceiling() -> usize {
-    let mut lo = 1usize;
-    let mut hi = 4096usize;
-    let mut last_success = 1usize;
-
-    while lo <= hi {
-        let mid = lo + (hi - lo) / 2;
-        let handles: Vec<_> = (0..mid)
-            .map(|_| {
-                thread::Builder::new()
-                    .stack_size(64 * 1024)
-                    .spawn(|| {})
-                    .ok()
-            })
-            .collect();
-        let all_spawned = handles.iter().all(|h| h.is_some());
-        for h in handles.into_iter().flatten() {
-            let _ = h.join();
-        }
-        if all_spawned {
-            last_success = mid;
-            lo = mid + 1;
-        } else {
-            hi = mid - 1;
-        }
-    }
-
-    last_success.saturating_sub(8).max(1)
-}
-
-fn setup_broker<T: Copy + Send + Sync + 'static>(
-    topics: usize,
-    capacity: usize,
-) -> (Producer<T>, ConsumerContext<T>, Vec<TopicId>) {
-    let config = BctowConfig {
-        ring_buffer_capacity: capacity,
-        overflow_policy: OverflowPolicy::DropOldest,
-    };
-    let (producer, ctx) = bctow::broker::<T>(config);
-    let topic_ids: Vec<TopicId> = (0..topics)
-        .map(|i| producer.register_topic(format!("topic/{i}")))
-        .collect();
-    (producer, ctx, topic_ids)
-}
-
-fn fill_fixed_bytes<const N: usize>() -> FixedBytes<N> {
-    let mut data = [0u8; N];
-    for i in 0..N {
-        data[i] = ((i % 255) + 1) as u8;
-    }
-    FixedBytes::new(&data).expect("fill_fixed_bytes: slice fits in N")
-}
-
-fn drain_loop<T: Copy + Send + Sync + 'static>(
-    mut clients: Vec<bctow::ConsumerClient<T>>,
-    barrier: Arc<Barrier>,
-    messages_expected: u64,
-    counter: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
-) {
-    barrier.wait();
-    if clients.is_empty() {
-        return;
-    }
-    loop {
-        let current = counter.load(Ordering::Acquire);
-        if current >= messages_expected {
-            break;
-        }
-        if stop.load(Ordering::Acquire) {
-            break;
-        }
-        for client in &mut clients {
-            if let Some(msg) = client.poll() {
-                std::hint::black_box(msg);
-                counter.fetch_add(1, Ordering::AcqRel);
-            }
-        }
-    }
-}
-
-struct ConsumerHandle {
-    barrier: Arc<Barrier>,
-    done: Arc<AtomicU64>,
-    thread_count: u64,
-    stop: Arc<AtomicBool>,
-    threads: Vec<thread::JoinHandle<()>>,
-}
-
-impl ConsumerHandle {
-    fn release(&self) {
-        self.barrier.wait();
-    }
-
-    fn wait(mut self, timeout: Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        while self.done.load(Ordering::Acquire) < self.thread_count {
-            if std::time::Instant::now() >= deadline {
-                self.stop.store(true, Ordering::Release);
-                return false;
-            }
-            std::hint::spin_loop();
-        }
-        for h in self.threads.drain(..) {
-            let _ = h.join();
-        }
-        true
-    }
-}
-
-fn spawn_consumers<T: Copy + Send + Sync + 'static>(
-    ctx: &ConsumerContext<T>,
-    topic_ids: &[TopicId],
-    count: usize,
-    threads: usize,
-    messages_per_consumer: u64,
-) -> ConsumerHandle {
-    let ceiling = thread_ceiling();
-    let actual_threads = count.min(threads).min(ceiling);
-
-    let barrier = Arc::new(Barrier::new(actual_threads + 1));
-    let done = Arc::new(AtomicU64::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
-    let total_messages = (count as u64) * messages_per_consumer;
-
-    let mut all_clients: Vec<bctow::ConsumerClient<T>> = (0..count)
-        .map(|_| {
-            let mut client = ctx.create_client();
-            for &id in topic_ids {
-                client.subscribe_id(id).expect("subscribe_id failed");
-            }
-            client
-        })
-        .collect();
-
-    let clients_per_thread = count / actual_threads;
-    let remainder = count % actual_threads;
-    let mut thread_handles = Vec::with_capacity(actual_threads);
-    let counter = Arc::new(AtomicU64::new(0));
-
-    for t in 0..actual_threads {
-        let extra = if t < remainder { 1 } else { 0 };
-        let batch_size = clients_per_thread + extra;
-        let batch: Vec<bctow::ConsumerClient<T>> = all_clients.drain(..batch_size).collect();
-
-        let b = Arc::clone(&barrier);
-        let ctr = Arc::clone(&counter);
-        let done_flag = Arc::clone(&done);
-        let stop_flag = Arc::clone(&stop);
-
-        let handle = thread::spawn(move || {
-            drain_loop(batch, b, total_messages, ctr, stop_flag);
-            done_flag.fetch_add(1, Ordering::Release);
-        });
-        thread_handles.push(handle);
-    }
-
-    ConsumerHandle {
-        barrier,
-        done,
-        thread_count: actual_threads as u64,
-        stop,
-        threads: thread_handles,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -216,7 +48,10 @@ fn setup_broker_zero_topics_returns_empty_vec() {
 fn thread_ceiling_returns_positive_value() {
     // Exercises the binary-search probe path and verifies it never deadlocks.
     let ceiling = thread_ceiling();
-    assert!(ceiling >= 1, "thread_ceiling must be at least 1, got {ceiling}");
+    assert!(
+        ceiling >= 1,
+        "thread_ceiling must be at least 1, got {ceiling}"
+    );
 }
 
 #[test]
@@ -312,7 +147,10 @@ fn spawn_consumers_distributes_clients_and_drains_messages() {
 
     handle.release();
     let completed = handle.wait(Duration::from_secs(10));
-    assert!(completed, "spawn_consumers should drain 40 messages within timeout");
+    assert!(
+        completed,
+        "spawn_consumers should drain 40 messages within timeout"
+    );
 }
 
 #[test]
@@ -332,4 +170,31 @@ fn spawn_consumers_handles_more_consumers_than_threads() {
     handle.release();
     let completed = handle.wait(Duration::from_secs(10));
     assert!(completed, "multiplexed consumers should drain all messages");
+}
+
+#[test]
+fn terminal_consumers_finish_after_ring_wraps_and_drops() {
+    let (producer, ctx, topic_ids) = setup_broker::<bctow::FixedBytes<512>>(1, CONTENTION_CAPACITY);
+    let handle = spawn_consumers_until(&ctx, &topic_ids, 5, 2, |message| message.is_empty());
+    let value = fill_fixed_bytes::<512>();
+    assert!(CONTENTION_MESSAGES > CONTENTION_CAPACITY as u64);
+    // Hold consumers until after overflow to guarantee that delivery counts
+    // cannot reach the number published. The terminal message remains retained.
+    for _ in 0..CONTENTION_MESSAGES {
+        producer.publish_id(topic_ids[0], &value).unwrap();
+    }
+    producer
+        .publish_id(topic_ids[0], &bctow::FixedBytes::new(&[]).unwrap())
+        .unwrap();
+    handle.release();
+    assert!(handle.wait(Duration::from_secs(5)));
+}
+
+#[test]
+fn terminal_consumers_timeout_when_terminal_is_missing() {
+    let (producer, ctx, topic_ids) = setup_broker::<u64>(1, 2);
+    let handle = spawn_consumers_until(&ctx, &topic_ids, 3, 2, |message| *message == 99);
+    producer.publish_id(topic_ids[0], &1).unwrap();
+    handle.release();
+    assert!(!handle.wait(Duration::ZERO));
 }
