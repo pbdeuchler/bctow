@@ -71,8 +71,11 @@ impl<T: Copy> RingBuffer<T> {
         let prior_access = slot.access.fetch_or(WRITER, Ordering::AcqRel);
         debug_assert_eq!(prior_access & WRITER, 0, "single producer required");
 
-        while slot.access.load(Ordering::Acquire) != WRITER {
-            spin_loop();
+        // fetch_or already acquired the slot if there were no admitted readers.
+        if prior_access != 0 {
+            while slot.access.load(Ordering::Acquire) != WRITER {
+                spin_loop();
+            }
         }
 
         unsafe {
