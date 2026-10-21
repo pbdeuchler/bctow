@@ -94,6 +94,12 @@ impl<T: Copy> RingBuffer<T> {
         let idx = ((seq - 1) % self.capacity as u64) as usize;
         let slot = &self.slots[idx];
 
+        // Most empty polls can avoid writing the shared admission counter.
+        // This is only a hint: the sequence must be checked again after admission.
+        if slot.sequence.load(Ordering::Relaxed) != seq {
+            return None;
+        }
+
         let mut access = slot.access.load(Ordering::Relaxed);
         loop {
             // Refuse admission during a write or if incrementing would set WRITER.
@@ -227,6 +233,31 @@ mod tests {
 
         let mut dst = MaybeUninit::<u64>::uninit();
         assert!(ring.read_into(1, &mut dst).is_none());
+    }
+
+    #[test]
+    fn unavailable_sequences_preserve_the_callers_buffer() {
+        let ring = RingBuffer::<u64>::new(2);
+        for value in [11, 22, 33] {
+            ring.push(&value);
+        }
+        for (seq, expected) in [
+            (0, None),
+            (1, None),
+            (2, Some(22)),
+            (3, Some(33)),
+            (4, None),
+        ] {
+            let mut dst = MaybeUninit::new(99);
+            assert_eq!(
+                ring.read_into(seq, &mut dst)
+                    .map(|()| unsafe { dst.assume_init() }),
+                expected
+            );
+            if expected.is_none() {
+                assert_eq!(unsafe { dst.assume_init() }, 99);
+            }
+        }
     }
 
     #[test]
