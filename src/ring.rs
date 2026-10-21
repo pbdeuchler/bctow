@@ -3,11 +3,11 @@ use std::hint::spin_loop;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+const WRITER: usize = 1 << (usize::BITS - 1);
+
 struct Slot<T> {
-    /// Even = stable snapshot, odd = writer owns the slot.
-    version: AtomicU64,
-    /// Number of readers currently copying data out of this slot.
-    readers: AtomicUsize,
+    /// High bit excludes new readers; remaining bits count active readers.
+    access: AtomicUsize,
     /// Sequence number currently stored in the slot. `0` means empty.
     sequence: AtomicU64,
     data: UnsafeCell<MaybeUninit<T>>,
@@ -16,15 +16,18 @@ struct Slot<T> {
 impl<T> Slot<T> {
     fn new() -> Self {
         Self {
-            version: AtomicU64::new(0),
-            readers: AtomicUsize::new(0),
+            access: AtomicUsize::new(0),
             sequence: AtomicU64::new(0),
             data: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
 }
 
-// SAFETY: Slot access is coordinated by the per-slot version/readers protocol.
+// SAFETY: Slot access is coordinated by the per-slot access atomic. Reader
+// admission and writer exclusion share one modification order: a reader either
+// increments before the writer sets WRITER (and the writer waits for it), or its
+// CAS fails and it cannot access the payload. Release unlocks and Acquire locks
+// order payload accesses between owners. Shared readers only read T: Sync.
 unsafe impl<T: Send> Send for Slot<T> {}
 unsafe impl<T: Sync> Sync for Slot<T> {}
 
@@ -66,10 +69,10 @@ impl<T: Copy> RingBuffer<T> {
         let idx = ((seq - 1) as usize) % self.capacity;
         let slot = &self.slots[idx];
 
-        let prior_version = slot.version.fetch_add(1, Ordering::AcqRel);
-        debug_assert_eq!(prior_version % 2, 0, "single producer must see stable slot");
+        let prior_access = slot.access.fetch_or(WRITER, Ordering::AcqRel);
+        debug_assert_eq!(prior_access & WRITER, 0, "single producer required");
 
-        while slot.readers.load(Ordering::Acquire) != 0 {
+        while slot.access.load(Ordering::Acquire) != WRITER {
             spin_loop();
         }
 
@@ -77,8 +80,8 @@ impl<T: Copy> RingBuffer<T> {
             let dst = &mut *slot.data.get();
             std::ptr::copy_nonoverlapping(value as *const T, dst.as_mut_ptr(), 1);
         }
-        slot.sequence.store(seq, Ordering::Release);
-        slot.version.fetch_add(1, Ordering::Release);
+        slot.sequence.store(seq, Ordering::Relaxed);
+        slot.access.store(0, Ordering::Release);
 
         seq
     }
@@ -91,22 +94,25 @@ impl<T: Copy> RingBuffer<T> {
         let idx = ((seq - 1) as usize) % self.capacity;
         let slot = &self.slots[idx];
 
-        let version_before = slot.version.load(Ordering::Acquire);
-        if version_before % 2 == 1 {
-            return None;
+        let mut access = slot.access.load(Ordering::Relaxed);
+        loop {
+            // Refuse admission during a write or if incrementing would set WRITER.
+            if access >= WRITER - 1 {
+                return None;
+            }
+            match slot.access.compare_exchange_weak(
+                access,
+                access + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => access = current,
+            }
         }
 
-        let stored_seq = slot.sequence.load(Ordering::Acquire);
-        if stored_seq != seq {
-            return None;
-        }
-
-        slot.readers.fetch_add(1, Ordering::Acquire);
-
-        let version_after = slot.version.load(Ordering::Acquire);
-        let stored_after = slot.sequence.load(Ordering::Acquire);
-        if version_before != version_after || version_after % 2 == 1 || stored_after != seq {
-            slot.readers.fetch_sub(1, Ordering::Release);
+        if slot.sequence.load(Ordering::Relaxed) != seq {
+            slot.access.fetch_sub(1, Ordering::Release);
             return None;
         }
 
@@ -115,7 +121,7 @@ impl<T: Copy> RingBuffer<T> {
             std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr(), 1);
         }
 
-        slot.readers.fetch_sub(1, Ordering::Release);
+        slot.access.fetch_sub(1, Ordering::Release);
         Some(())
     }
 
@@ -181,6 +187,34 @@ mod tests {
         let mut dst = MaybeUninit::<u64>::uninit();
         ring.read_into(seq, &mut dst).unwrap();
         assert_eq!(unsafe { dst.assume_init() }, 42u64);
+    }
+
+    #[test]
+    fn unavailable_slot_leaves_destination_unchanged() {
+        let ring = RingBuffer::<u64>::new(1);
+        let mut dst = MaybeUninit::new(99);
+        assert!(ring.read_into(1, &mut dst).is_none());
+        ring.push(&42);
+
+        for access in [WRITER, WRITER | 1, WRITER - 1] {
+            ring.slots[0].access.store(access, Ordering::Relaxed);
+            assert!(ring.read_into(1, &mut dst).is_none());
+            assert_eq!(ring.slots[0].access.load(Ordering::Relaxed), access);
+            assert_eq!(unsafe { dst.assume_init() }, 99);
+        }
+
+        ring.slots[0].access.store(0, Ordering::Relaxed);
+        ring.read_into(1, &mut dst).unwrap();
+        assert_eq!(unsafe { dst.assume_init() }, 42);
+        assert_eq!(ring.slots[0].access.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "ring sequence overflow")]
+    fn exhausted_sequence_rejects_publish() {
+        let ring = RingBuffer::<u64>::new(1);
+        ring.write_seq.store(u64::MAX, Ordering::Relaxed);
+        ring.push(&42);
     }
 
     #[test]
