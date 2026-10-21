@@ -59,12 +59,11 @@ impl<T: Copy> RingBuffer<T> {
     }
 
     pub(crate) fn push(&self, value: &T) -> u64 {
-        let seq = self
-            .write_seq
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
-                next.checked_add(1)
-            })
-            .expect("ring sequence overflow");
+        // Only the single producer advances this counter; readers only load it.
+        // Preserve reservation-before-copy ordering without an unnecessary CAS.
+        let seq = self.write_seq.load(Ordering::Relaxed);
+        let next = seq.checked_add(1).expect("ring sequence overflow");
+        self.write_seq.store(next, Ordering::Release);
 
         let idx = ((seq - 1) % self.capacity as u64) as usize;
         let slot = &self.slots[idx];
@@ -222,6 +221,19 @@ mod tests {
         let ring = RingBuffer::<u64>::new(1);
         ring.write_seq.store(u64::MAX, Ordering::Relaxed);
         ring.push(&42);
+    }
+
+    #[test]
+    fn sequence_exhaustion_does_not_overwrite_the_retained_message() {
+        let ring = RingBuffer::<u64>::new(1);
+        ring.write_seq.store(u64::MAX - 1, Ordering::Relaxed);
+        let seq = ring.push(&42);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ring.push(&99)));
+        assert!(result.is_err());
+        assert_eq!(ring.write_seq.load(Ordering::Relaxed), u64::MAX);
+        let mut dst = MaybeUninit::uninit();
+        ring.read_into(seq, &mut dst).unwrap();
+        assert_eq!(unsafe { dst.assume_init() }, 42);
     }
 
     #[test]
