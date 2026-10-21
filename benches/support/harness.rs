@@ -33,6 +33,7 @@ pub fn setup_broker<T: Copy + Send + Sync + 'static>(
 pub struct ConsumerHandle {
     barrier: Arc<Barrier>,
     done: Arc<AtomicU64>,
+    counter: Arc<AtomicU64>,
     thread_count: u64,
     stop: Arc<AtomicBool>,
     threads: Vec<thread::JoinHandle<()>>,
@@ -51,24 +52,30 @@ impl ConsumerHandle {
 
     /// Wait up to `timeout` for all consumers to finish.
     /// Returns `true` if they completed within the deadline.
-    pub fn wait(mut self, timeout: Duration) -> bool {
+    pub fn wait(self, timeout: Duration) -> bool {
+        self.wait_with_count(timeout).0
+    }
+
+    /// Wait for completion and return the actual deliveries, including terminal
+    /// messages and any partial progress made before cancellation on timeout.
+    pub fn wait_with_count(mut self, timeout: Duration) -> (bool, u64) {
         let deadline = std::time::Instant::now() + timeout;
         // Spin-check the done counter rather than parking, to avoid
         // re-introducing scheduler-induced latency in bench measurements.
-        while self.done.load(Ordering::Acquire) < self.thread_count {
+        let completed = loop {
+            if self.done.load(Ordering::Acquire) >= self.thread_count {
+                break true;
+            }
             if std::time::Instant::now() >= deadline {
                 self.stop.store(true, Ordering::Release);
-                for h in self.threads.drain(..) {
-                    h.join().expect("consumer thread panicked");
-                }
-                return false;
+                break false;
             }
             std::hint::spin_loop();
-        }
+        };
         for h in self.threads.drain(..) {
             h.join().expect("consumer thread panicked");
         }
-        true
+        (completed, self.counter.load(Ordering::Acquire))
     }
 }
 
@@ -137,8 +144,8 @@ pub fn spawn_workers_with<T: Copy + Send + Sync + 'static>(
     // Incremented once per thread when it exits the drain loop
     let done = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
-    let (total_messages, is_terminal) = match target {
-        DrainTarget::Messages(messages) => ((count as u64) * messages, None),
+    let (messages_per_consumer, is_terminal) = match target {
+        DrainTarget::Messages(messages) => (messages, None),
         DrainTarget::Terminal(predicate) => (0, Some(predicate)),
     };
 
@@ -167,7 +174,15 @@ pub fn spawn_workers_with<T: Copy + Send + Sync + 'static>(
 
         let task = Box::new(move || {
             if let Ok((batch, barrier)) = receive.recv() {
-                drain_loop_until(batch, barrier, total_messages, ctr, stop_flag, is_terminal);
+                let messages_expected = batch.len() as u64 * messages_per_consumer;
+                drain_loop_until(
+                    batch,
+                    barrier,
+                    messages_expected,
+                    ctr,
+                    stop_flag,
+                    is_terminal,
+                );
                 done_flag.fetch_add(1, Ordering::Release);
             }
         });
@@ -197,6 +212,7 @@ pub fn spawn_workers_with<T: Copy + Send + Sync + 'static>(
     Ok(ConsumerHandle {
         barrier,
         done,
+        counter,
         thread_count: actual_threads as u64,
         stop,
         threads: thread_handles,
@@ -204,8 +220,8 @@ pub fn spawn_workers_with<T: Copy + Send + Sync + 'static>(
 }
 
 /// Per-thread poll loop. Waits on `barrier`, then polls all owned clients in
-/// round-robin, incrementing `counter` on each received message. Exits when
-/// the shared counter reaches `messages_expected` or `stop` is set.
+/// round-robin until this worker receives `messages_expected` or `stop` is set.
+/// Adds its local delivery count to the shared aggregate once, on exit.
 pub fn drain_loop<T: Copy + Send + Sync + 'static>(
     clients: Vec<ConsumerClient<T>>,
     barrier: Arc<Barrier>,
@@ -225,13 +241,13 @@ fn drain_loop_until<T: Copy + Send + Sync + 'static>(
     is_terminal: Option<fn(&T) -> bool>,
 ) {
     let mut finished = vec![false; clients.len()];
+    let mut delivered = 0;
     barrier.wait();
     if clients.is_empty() {
         return;
     }
-    loop {
-        let current = counter.load(Ordering::Acquire);
-        if is_terminal.is_none() && current >= messages_expected {
+    'drain: loop {
+        if is_terminal.is_none() && delivered >= messages_expected {
             break;
         }
         if stop.load(Ordering::Acquire) {
@@ -243,9 +259,11 @@ fn drain_loop_until<T: Copy + Send + Sync + 'static>(
             }
             if let Some(msg) = client.poll() {
                 std::hint::black_box(msg);
-                counter.fetch_add(1, Ordering::AcqRel);
+                delivered += 1;
                 if let Some(is_terminal) = is_terminal {
                     *finished = is_terminal(msg.message);
+                } else if delivered >= messages_expected {
+                    break 'drain;
                 }
             }
         }
@@ -253,6 +271,7 @@ fn drain_loop_until<T: Copy + Send + Sync + 'static>(
             break;
         }
     }
+    counter.fetch_add(delivered, Ordering::Relaxed);
 }
 
 /// Produces a deterministic non-zero fill pattern for `FixedBytes<N>`.

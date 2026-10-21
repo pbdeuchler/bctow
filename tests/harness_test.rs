@@ -114,6 +114,7 @@ fn drain_loop_exits_when_stop_flag_set() {
     handle
         .join()
         .expect("drain thread should have exited after stop flag");
+    assert_eq!(counter.load(Ordering::Acquire), 0);
 }
 
 #[test]
@@ -130,6 +131,34 @@ fn drain_loop_with_no_clients_returns_without_deliveries() {
 }
 
 #[test]
+fn drain_loop_counts_exact_local_target_and_preserves_other_workers_counts() {
+    for expected in [0, 1, 3, 4] {
+        let (producer, ctx, topic_ids) = setup_broker::<u64>(1, 8);
+        let clients = (0..2)
+            .map(|_| {
+                let mut client = ctx.create_client();
+                client.subscribe_id(topic_ids[0]).unwrap();
+                client
+            })
+            .collect();
+        for value in 0..3 {
+            producer.publish_id(topic_ids[0], &value).unwrap();
+        }
+        let counter = Arc::new(AtomicU64::new(10));
+        drain_loop(
+            clients,
+            Arc::new(Barrier::new(1)),
+            expected,
+            Arc::clone(&counter),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(counter.load(Ordering::Acquire), 10 + expected);
+        #[cfg(feature = "metrics")]
+        assert_eq!(ctx.metrics().messages_delivered, expected);
+    }
+}
+
+#[test]
 fn spawn_consumers_distributes_clients_and_drains_messages() {
     let (producer, ctx, topic_ids) = setup_broker::<u64>(1, 1024);
     let topic_id = topic_ids[0];
@@ -143,11 +172,14 @@ fn spawn_consumers_distributes_clients_and_drains_messages() {
     }
 
     handle.release();
-    let completed = handle.wait(Duration::from_secs(10));
+    let (completed, delivered) = handle.wait_with_count(Duration::from_secs(10));
     assert!(
         completed,
         "spawn_consumers should drain 40 messages within timeout"
     );
+    assert_eq!(delivered, 40);
+    #[cfg(feature = "metrics")]
+    assert_eq!(ctx.metrics().messages_delivered, delivered);
 }
 
 #[test]
@@ -165,8 +197,9 @@ fn spawn_consumers_handles_more_consumers_than_threads() {
     }
 
     handle.release();
-    let completed = handle.wait(Duration::from_secs(10));
+    let (completed, delivered) = handle.wait_with_count(Duration::from_secs(10));
     assert!(completed, "multiplexed consumers should drain all messages");
+    assert_eq!(delivered, 60);
 }
 
 #[test]
@@ -185,7 +218,11 @@ fn terminal_consumers_finish_after_ring_wraps_and_drops() {
         .publish_id(topic_ids[0], &bctow::FixedBytes::new(&[]).unwrap())
         .unwrap();
     handle.release();
-    assert!(handle.wait(Duration::from_secs(5)));
+    let (completed, delivered) = handle.wait_with_count(Duration::from_secs(5));
+    assert!(completed);
+    assert_eq!(delivered, 5 * CONTENTION_CAPACITY as u64);
+    #[cfg(feature = "metrics")]
+    assert_eq!(ctx.metrics().messages_delivered, delivered);
 }
 
 #[test]
@@ -243,7 +280,12 @@ fn worker_spawning_distributes_all_clients_across_live_workers() {
         handle.release();
         // Since the ring never overflowed, completion requires all messages to
         // reach every client, including clients redistributed after spawn failure.
-        assert!(handle.wait(Duration::from_secs(5)));
+        assert_eq!(
+            handle.wait_with_count(Duration::from_secs(5)),
+            (true, count as u64 * 10)
+        );
+        #[cfg(feature = "metrics")]
+        assert_eq!(ctx.metrics().messages_delivered, count as u64 * 10);
         assert_eq!(exited.load(Ordering::Acquire), expected as u64);
     }
 }
@@ -287,7 +329,7 @@ fn timeout_joins_all_workers_before_returning() {
     )
     .unwrap();
     handle.release();
-    assert!(!handle.wait(Duration::ZERO));
+    assert_eq!(handle.wait_with_count(Duration::ZERO), (false, 0));
     assert_eq!(exited.load(Ordering::Acquire), 2);
 }
 
@@ -296,5 +338,31 @@ fn consumers_with_no_expected_messages_complete_without_publishing() {
     let (_producer, ctx, topic_ids) = setup_broker::<u64>(1, 2);
     let handle = spawn_consumers(&ctx, &topic_ids, 3, 2, 0).unwrap();
     handle.release();
-    assert!(handle.wait(Duration::from_secs(5)));
+    assert_eq!(handle.wait_with_count(Duration::from_secs(5)), (true, 0));
+}
+
+#[test]
+fn timeout_returns_partial_delivery_count_after_joining() {
+    static OBSERVED: AtomicBool = AtomicBool::new(false);
+    OBSERVED.store(false, Ordering::Relaxed);
+    let (producer, ctx, topic_ids) = setup_broker::<u64>(1, 2);
+    let handle = spawn_consumers_until(&ctx, &topic_ids, 1, 1, |message| {
+        if *message == 1 {
+            OBSERVED.store(true, Ordering::Release);
+        }
+        *message == 99
+    })
+    .unwrap();
+    producer.publish_id(topic_ids[0], &1).unwrap();
+    handle.release();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !OBSERVED.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+        std::hint::spin_loop();
+    }
+    let observed = OBSERVED.load(Ordering::Acquire);
+    let result = handle.wait_with_count(Duration::ZERO);
+    assert!(observed, "consumer did not observe the first message");
+    assert_eq!(result, (false, 1));
+    #[cfg(feature = "metrics")]
+    assert_eq!(ctx.metrics().messages_delivered, 1);
 }

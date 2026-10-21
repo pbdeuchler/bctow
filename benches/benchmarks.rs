@@ -5,7 +5,7 @@ mod harness;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 
-use criterion::{black_box, criterion_group, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
 
 fn operations_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("operations");
@@ -24,7 +24,7 @@ fn operations_benchmark(c: &mut Criterion) {
     });
 
     // publish_string_lookup: same publish path but via string name.
-    // Delta vs publish_id_warm isolates RwLock read + HashMap lookup cost.
+    // Includes registry lookup and temporary entry ownership in addition to publishing.
     group.bench_function("publish_string_lookup", |b| {
         let (producer, _ctx, _topic_ids) = harness::setup_broker::<u64>(1, 1024);
         // Warm with one publish so the ring cache entry exists.
@@ -37,8 +37,7 @@ fn operations_benchmark(c: &mut Criterion) {
     });
 
     // poll_hit: publish one message then poll it. Measures publish+poll round-trip.
-    // Subtracting publish_id_warm from this isolates the poll cost, assuming
-    // publish_id overhead is identical in both benchmarks (same code path).
+    // This is a round-trip measurement, not an independent estimate of poll cost.
     group.bench_function("poll_hit", |b| {
         let (producer, ctx, topic_ids) = harness::setup_broker::<u64>(1, 1024);
         let topic_id = topic_ids[0];
@@ -173,12 +172,106 @@ fn ring_capacity_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
+fn broadcast_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("broadcast");
+    const MESSAGES: u64 = 65_536;
+    for consumers in [1, 2, 4] {
+        group.throughput(Throughput::Elements(MESSAGES * consumers as u64));
+        group.bench_function(BenchmarkId::from_parameter(consumers), |b| {
+            b.iter_batched(
+                || {
+                    let (producer, ctx, topics) =
+                        harness::setup_broker::<u64>(1, MESSAGES as usize);
+                    let handle =
+                        harness::spawn_consumers(&ctx, &topics, consumers, consumers, MESSAGES)
+                            .expect("broadcast benchmark needs consumer workers");
+                    assert_eq!(
+                        handle.thread_count(),
+                        consumers,
+                        "broadcast benchmark needs the requested concurrency"
+                    );
+                    (producer, topics[0], handle)
+                },
+                |(producer, topic, handle)| {
+                    handle.release();
+                    for value in 0..MESSAGES {
+                        producer.publish_id(topic, black_box(&value)).unwrap();
+                    }
+                    let (completed, delivered) =
+                        handle.wait_with_count(std::time::Duration::from_secs(10));
+                    assert!(completed, "every consumer must drain the retained batch");
+                    assert_eq!(delivered, MESSAGES * consumers as u64);
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
+}
+
+fn overwrite_broadcast_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("broadcast_overwrite");
+    const MESSAGES: u64 = 65_536;
+    // Consumers may drop messages; throughput counts publications, not deliveries.
+    group.throughput(Throughput::Elements(MESSAGES));
+    for consumers in [1, 2, 4] {
+        // Includes calibration and warmup batches, not just measured samples.
+        let mut observations = (0u64, 0u64, u64::MAX, 0u64);
+        group.bench_function(BenchmarkId::from_parameter(consumers), |b| {
+            b.iter_batched(
+                || {
+                    let (producer, ctx, topics) = harness::setup_broker::<u64>(1, 64);
+                    let handle = harness::spawn_consumers_until(
+                        &ctx,
+                        &topics,
+                        consumers,
+                        consumers,
+                        |value| *value == u64::MAX,
+                    )
+                    .expect("overwrite benchmark needs consumer workers");
+                    assert_eq!(
+                        handle.thread_count(),
+                        consumers,
+                        "overwrite benchmark needs the requested concurrency"
+                    );
+                    (producer, topics[0], handle)
+                },
+                |(producer, topic, handle)| {
+                    handle.release();
+                    for value in 0..MESSAGES {
+                        producer.publish_id(topic, black_box(&value)).unwrap();
+                    }
+                    producer.publish_id(topic, &u64::MAX).unwrap();
+                    let (completed, delivered) =
+                        handle.wait_with_count(std::time::Duration::from_secs(10));
+                    assert!(
+                        completed,
+                        "every consumer must observe the terminal message"
+                    );
+                    assert!(
+                        (consumers as u64..=(MESSAGES + 1) * consumers as u64).contains(&delivered)
+                    );
+                    observations.0 += 1;
+                    observations.1 += delivered;
+                    observations.2 = observations.2.min(delivered);
+                    observations.3 = observations.3.max(delivered);
+                },
+                BatchSize::PerIteration,
+            );
+        });
+        println!("[broadcast_overwrite/deliveries] consumers={consumers} batches={} mean={:.1} min={} max={}", observations.0, observations.1 as f64 / observations.0 as f64, observations.2, observations.3);
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     operations_benchmark,
     message_size_benchmark,
     subscription_scan_benchmark,
-    ring_capacity_benchmark
+    ring_capacity_benchmark,
+    broadcast_benchmark,
+    overwrite_broadcast_benchmark
 );
 
 fn consumer_scaling() {
@@ -240,8 +333,8 @@ fn topic_scaling() {
             client.subscribe_id(id).unwrap();
         }
 
-        // Publish all messages up front; at 10K topics this primarily measures
-        // poll()'s O(N) HashMap scan over subscriptions, not ring performance.
+        // Every topic has pending messages, so round-robin polling normally
+        // succeeds on the first candidate. This exercises the active working set.
         for &id in &topic_ids {
             for i in 0..messages_per_topic {
                 producer.publish_id(id, &i).unwrap();
@@ -274,14 +367,8 @@ fn topic_scaling() {
             0.0
         };
 
-        // At 10K topics the measurement is dominated by poll()'s O(N) HashMap scan.
-        let note = if topics >= 10000 {
-            " note=primarily_measures_poll_scan"
-        } else {
-            ""
-        };
         println!(
-            "[scaling/topic_scaling] topics={topics} messages_per_topic={messages_per_topic} total_messages={total_messages} throughput_msg_sec={throughput:.0} latency_ns_per_msg={latency_ns:.0} elapsed_ms={:.2} completed={completed}{note}",
+            "[scaling/topic_scaling] topics={topics} messages_per_topic={messages_per_topic} total_messages={total_messages} throughput_msg_sec={throughput:.0} latency_ns_per_msg={latency_ns:.0} elapsed_ms={:.2} completed={completed}",
             elapsed.as_secs_f64() * 1000.0
         );
     }
